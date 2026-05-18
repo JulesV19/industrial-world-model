@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+world_model/checkpoints/
+.DS_Store
+dataset/
