@@ -61,6 +61,7 @@ class Normalizer:
         return x * std + mean
 
     def save(self, path: str):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         np.savez(path, mean=self.mean, std=self.std)
 
     @classmethod
