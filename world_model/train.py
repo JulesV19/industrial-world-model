@@ -103,6 +103,8 @@ def train(cfg: dict | None = None):
     episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
     print(f"Episodes : {len(episode_paths)}")
 
+    os.makedirs(H["save_dir"], exist_ok=True)
+
     full_ds = TrajectoryDataset(episode_paths, piece_db)
     full_ds.normalizer.save(os.path.join(H["save_dir"], "normalizer.npz"))
 
@@ -137,8 +139,6 @@ def train(cfg: dict | None = None):
         model.parameters(), lr=H["lr"], weight_decay=H["weight_decay"]
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=H["epochs"], eta_min=1e-5)
-
-    os.makedirs(H["save_dir"], exist_ok=True)
 
     best_val      = float("inf")
     history       = dict(train=[], val=[], mse=[], bce=[], kl=[], lr=[], grad_norm=[])
