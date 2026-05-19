@@ -104,11 +104,13 @@ def train(cfg: dict | None = None):
 
     train_loader = DataLoader(
         train_ds, batch_size=H["batch_size"],
-        shuffle=True, collate_fn=collate_fn, num_workers=0,
+        shuffle=True, collate_fn=collate_fn,
+        num_workers=4, pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=H["batch_size"],
-        shuffle=False, collate_fn=collate_fn, num_workers=0,
+        shuffle=False, collate_fn=collate_fn,
+        num_workers=4, pin_memory=True,
     )
     print(f"Train : {n_train}  |  Val : {n_val}")
 

@@ -335,16 +335,11 @@ def generate_shape_database(num_shapes=100):
     db = []
 
     for _ in range(num_shapes):
-        # ── position du centre ─────────────────────────────────────────────────
-        # Centre dans [0.5, 1.5]² pour laisser de la marge aux bords du carré
-        for _ in range(20):
-            base_x = random.uniform(0.5, 1.5)
-            base_y = random.uniform(0.5, 1.5)
-            if math.hypot(base_x, base_y) < _MAX_REACH:
-                break
+        # ── position du centre : toujours au centre du workspace ──────────────
+        base_x, base_y = 1.0, 1.0   # centre de [0,2]²
 
         # ── scale de base (pièces larges ~50cm–1m, clampées dans [0.1,1.9]²) ──────
-        scale = random.uniform(0.50, 0.80)
+        scale = random.uniform(1.2, 1.6)
 
         # ── choix et génération de la forme ──────────────────────────────────
         shape_type = random.choice(_SHAPE_NAMES)
