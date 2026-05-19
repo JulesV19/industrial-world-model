@@ -25,6 +25,7 @@ from .model import WorldModel
 
 # ── default hyperparameters ────────────────────────────────────────────────────
 DEFAULTS = dict(
+    early_stopping  = 40,       # arrêt si pas d'amélioration pendant N epochs (0 = désactivé)
     shape_embed_dim = 256,
     h_dim           = 512,
     z_dim           = 64,
@@ -268,6 +269,12 @@ def train(cfg: dict | None = None):
             f"         val    loss={avg_val:.4f}  mse={avg_mse:.4f}  "
             f"bce={avg_bce:.4f}  kl={avg_kl:.4f}{marker}"
         )
+
+        # Early stopping
+        patience = H["early_stopping"]
+        if patience > 0 and epochs_no_imp >= patience:
+            tqdm.write(f"\nEarly stopping — pas d'amélioration depuis {patience} epochs.")
+            break
 
     total_time = time.time() - t_start
     print(f"\nDone in {_fmt_time(total_time)}.  Best val loss : {best_val:.4f}")
