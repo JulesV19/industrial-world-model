@@ -15,6 +15,11 @@ METRIC_KEYS = [
     ("tau",        2),
     ("is_cutting", 1),
 ]
+# Clés calculées (non stockées dans le npz)
+COMPUTED_KEYS = {
+    "q_error": lambda data: data["q_real"] - data["q_des"],  # erreur réelle de la machine
+}
+
 OBS_DIM = sum(d for _, d in METRIC_KEYS)   # 15
 
 CONTINUOUS_SLICE = slice(0, 14)
@@ -25,22 +30,27 @@ def build_obs_vector(data, keys=None) -> np.ndarray:
     """
     Concatène les signaux demandés en un vecteur (T, D).
     keys : liste de noms de signaux, ex. ["q_des"] ou None pour tous.
+           Accepte aussi les clés calculées comme "q_error".
     """
-    source = dict(METRIC_KEYS)
     if keys is None:
         keys = [k for k, _ in METRIC_KEYS]
     parts = []
     for key in keys:
-        arr = data[key]
+        if key in COMPUTED_KEYS:
+            arr = COMPUTED_KEYS[key](data)
+        else:
+            arr = data[key]
         if arr.ndim == 1:
             arr = arr[:, None]
         parts.append(arr)
     return np.concatenate(parts, axis=-1).astype(np.float32)
 
 
+COMPUTED_KEY_DIMS = {"q_error": 2}
+
 def target_dim(keys) -> int:
     """Dimension totale des signaux cibles."""
-    d = dict(METRIC_KEYS)
+    d = {**dict(METRIC_KEYS), **COMPUTED_KEY_DIMS}
     return sum(d[k] for k in keys)
 
 

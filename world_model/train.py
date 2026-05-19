@@ -42,7 +42,7 @@ DEFAULTS = dict(
     num_workers     = 0,        # 0 = optimal : dataset entièrement pré-chargé en RAM
     subsample_factor= 1,        # sous-échantillonnage temporel (ex: 10 = 1 step sur 10)
     use_amp         = True,     # mixed precision BF16 (A100/T4 uniquement)
-    target_keys     = "q_real",  # signaux à prédire (séparés par virgule)
+    target_keys     = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
     save_dir        = "world_model/checkpoints",
     data_dir        = "dataset",
     db_path         = "pieces_database.json",

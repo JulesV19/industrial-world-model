@@ -175,9 +175,6 @@ def load_model_records(data_dir: str, piece_db: list, model_path: str,
     print()
 
     # ── vectorised FK + defect (sur les pas sous-échantillonnés) ─────────────
-    q_pred_flat = q_pred_all[:, :, :2].reshape(-1, 2)
-    fk_pred_all = fk_batch(q_pred_flat).reshape(N, max_sub, 2)
-
     q_des_sub_padded = np.zeros((N, max_sub, 2), dtype=np.float32)
     ic_sub_padded    = np.zeros((N, max_sub),    dtype=np.float32)
     for i in range(N):
@@ -185,7 +182,20 @@ def load_model_records(data_dir: str, piece_db: list, model_path: str,
         q_des_sub_padded[i, :n] = all_q_des[i][::sf, :2]
         ic_sub_padded   [i, :n] = all_is_cutting[i][::sf]
 
-    fk_des_all    = fk_batch(q_des_sub_padded.reshape(-1, 2)).reshape(N, max_sub, 2)
+    # Si le modèle prédit q_error (= q_real - q_des), reconstruire q_eff = q_des + delta
+    target_keys = H.get("target_keys", ["q_real"])
+    if isinstance(target_keys, str):
+        target_keys = [k.strip() for k in target_keys.split(",")]
+    predicts_error = target_keys == ["q_error"]
+
+    q_pred_joints = q_pred_all[:, :, :2]
+    if predicts_error:
+        q_eff = q_des_sub_padded + q_pred_joints   # q_des + erreur simulée
+    else:
+        q_eff = q_pred_joints                      # q_real prédit directement
+
+    fk_pred_all = fk_batch(q_eff.reshape(-1, 2)).reshape(N, max_sub, 2)
+    fk_des_all  = fk_batch(q_des_sub_padded.reshape(-1, 2)).reshape(N, max_sub, 2)
     deviation_all = np.linalg.norm(fk_pred_all - fk_des_all, axis=2)   # (N, max_sub)
 
     records = []
