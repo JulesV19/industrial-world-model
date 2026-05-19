@@ -26,7 +26,7 @@ from torch.utils.data import random_split
 
 from .dataset import (
     BINARY_IDX, METRIC_KEYS, Normalizer,
-    TrajectoryDataset, build_obs_vector, collate_fn,
+    TrajectoryDataset, build_obs_vector, collate_fn, target_dim,
 )
 from .model import WorldModel
 from .train import DEFAULTS, get_device
@@ -64,13 +64,12 @@ def _load(save_dir: str, device: torch.device):
     ckpt = torch.load(os.path.join(save_dir, "best_model.pt"), map_location=device)
     H    = {**DEFAULTS, **ckpt.get("hyperparams", {})}
     model = WorldModel(
-        shape_embed_dim = H["shape_embed_dim"],
-        h_dim           = H["h_dim"],
-        z_dim           = H["z_dim"],
-        obs_dim         = H["obs_dim"],
+        shape_embed_dim = H.get("shape_embed_dim", 256),
+        h_dim           = H.get("h_dim", 512),
+        obs_dim         = H.get("obs_dim", 2),
         dropout         = 0.0,
-        free_bits       = H.get("free_bits", 0.5),
         gru_layers      = H.get("gru_layers", 3),
+        pe_dim          = H.get("pe_dim", 64),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -92,7 +91,9 @@ def _prepare_episode(episode_idx: int, save_dir: str, device: torch.device,
         piece_db = json.load(f)
 
     episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
-    full_ds = TrajectoryDataset(episode_paths, piece_db, normalizer=norm)
+    target_keys = H.get("target_keys", None)
+    full_ds = TrajectoryDataset(episode_paths, piece_db, normalizer=norm,
+                                target_keys=target_keys)
 
     # Reproduire le split train/val
     n_val   = max(1, int(len(full_ds) * H["val_split"]))
@@ -127,7 +128,13 @@ def _prepare_episode(episode_idx: int, save_dir: str, device: torch.device,
 
     pred = norm.denormalize(pred_norm)
     tgt  = norm.denormalize(tgt_norm)
-    pred[:, BINARY_IDX] = 1 / (1 + np.exp(-pred[:, BINARY_IDX]))
+
+    # Sigmoid sur is_cutting si présent
+    if target_keys and "is_cutting" in target_keys:
+        idx_cut = target_keys.index("is_cutting")
+        pred[:, idx_cut] = 1 / (1 + np.exp(-pred[:, idx_cut]))
+    elif target_keys is None:
+        pred[:, BINARY_IDX] = 1 / (1 + np.exp(-pred[:, BINARY_IDX]))
 
     # Waypoints de la pièce
     orig_idx        = subset.indices[episode_idx] if hasattr(subset, "indices") else episode_idx
@@ -148,9 +155,27 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
         episode_idx, save_dir, device, split=split
     )
 
-    # Cinématique
-    q_pred = pred[:seq_len, :2]   # q_real prédit
-    q_true = tgt [:seq_len, :2]   # q_real vrai
+    # Identifier les colonnes q (joints 0 et 1) dans les signaux prédits
+    # Cherche q_des en priorité, sinon q_real
+    _, _, H = _load(save_dir, device)
+    target_keys = H.get("target_keys") or [k for k, _ in METRIC_KEYS]
+    if isinstance(target_keys, str):
+        target_keys = [k.strip() for k in target_keys.split(",")]
+
+    # Colonnes de q dans pred/tgt
+    col = 0
+    q_col = None
+    for k in target_keys:
+        d = dict(METRIC_KEYS)[k]
+        if k in ("q_des", "q_real"):
+            q_col = col
+            break
+        col += d
+    if q_col is None:
+        raise ValueError(f"Aucun signal de position (q_des/q_real) dans target_keys={target_keys}")
+
+    q_pred = pred[:seq_len, q_col:q_col+2]
+    q_true = tgt [:seq_len, q_col:q_col+2]
 
     _, elbow_p, tip_p = fk(q_pred)
     _, elbow_t, tip_t = fk(q_true)
@@ -212,31 +237,40 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
                               fontsize=9, va="top")
     ax_arm.legend(fontsize=8, loc="upper right")
 
-    # ── graphes métriques ─────────────────────────────────────────────────────
-    def _plot_metric(ax, idx_true, idx_pred, ylabel, title):
-        ax.plot(t_axis, tgt [:seq_len, idx_true],
-                color="royalblue", lw=1.2, label="vrai")
-        ax.plot(t_axis, pred[:seq_len, idx_pred],
-                color="tomato", lw=1.2, ls="--", label="prédit", alpha=0.85)
+    # ── graphes métriques (adaptatifs selon target_keys) ─────────────────────
+    def _plot_metric(ax, col, ylabel, title):
+        ax.plot(t_axis, tgt [:seq_len, col], color="royalblue", lw=1.2, label="vrai")
+        ax.plot(t_axis, pred[:seq_len, col], color="tomato",    lw=1.2, ls="--",
+                label="prédit", alpha=0.85)
         ax.set_title(title, fontsize=9); ax.set_ylabel(ylabel, fontsize=8)
         ax.legend(fontsize=7, loc="upper right"); ax.grid(True, alpha=0.3)
-        vline = ax.axvline(0, color="gray", lw=1, ls=":")
-        return vline
+        return ax.axvline(0, color="gray", lw=1, ls=":")
 
-    vl_q1  = _plot_metric(ax_q1,  0,  0, "rad",   "q₁ réel")
-    vl_q2  = _plot_metric(ax_q2,  1,  1, "rad",   "q₂ réel")
-    vl_tau = _plot_metric(ax_tau, 12, 12, "N·m",  "τ₁ (couple)")
-    ax_cut.plot(t_axis, tgt [:seq_len, BINARY_IDX],
-                color="royalblue", lw=1.2, label="vrai")
-    ax_cut.plot(t_axis, pred[:seq_len, BINARY_IDX],
-                color="tomato", lw=1.2, ls="--", label="prédit", alpha=0.85)
-    ax_cut.set_title("is_cutting", fontsize=9)
-    ax_cut.set_ylabel("prob", fontsize=8); ax_cut.set_xlabel("t [s]", fontsize=8)
-    ax_cut.legend(fontsize=7, loc="upper right"); ax_cut.grid(True, alpha=0.3)
-    vl_cut = ax_cut.axvline(0, color="gray", lw=1, ls=":")
+    # Construire les graphes selon les colonnes disponibles
+    metric_axes   = [ax_q1, ax_q2, ax_tau, ax_cut]
+    vlines        = []
+    col = 0
+    plots_done = 0
+    for key in target_keys:
+        dim = dict(METRIC_KEYS)[key]
+        units = {"q_real":"rad","q_des":"rad","q_sensed":"rad",
+                 "dq_real":"rad/s","dq_des":"rad/s","dq_sensed":"rad/s",
+                 "tau":"N·m","is_cutting":"prob"}
+        for j in range(dim):
+            if plots_done >= len(metric_axes):
+                break
+            label = f"{key}[{j}]" if dim > 1 else key
+            ax = metric_axes[plots_done]
+            vlines.append(_plot_metric(ax, col + j, units.get(key, ""), label))
+            plots_done += 1
+        col += dim
+        if plots_done >= len(metric_axes):
+            break
+
+    metric_axes[-1].set_xlabel("t [s]", fontsize=8)
 
     # ── fonction de mise à jour ────────────────────────────────────────────────
-    history_len = 120   # points de tracé derrière le bras
+    history_len = 120
 
     def update(frame_idx):
         i = list(frames)[frame_idx]
@@ -258,11 +292,10 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
         time_text.set_text(f"t = {t:.2f} s")
 
         # Lignes verticales
-        for vl in (vl_q1, vl_q2, vl_tau, vl_cut):
+        for vl in vlines:
             vl.set_xdata([t, t])
 
-        return line_true, line_pred, trace_true, trace_pred, time_text, \
-               vl_q1, vl_q2, vl_tau, vl_cut
+        return (line_true, line_pred, trace_true, trace_pred, time_text, *vlines)
 
     anim = animation.FuncAnimation(
         fig, update, frames=len(list(frames)),
