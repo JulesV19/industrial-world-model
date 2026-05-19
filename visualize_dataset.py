@@ -86,7 +86,7 @@ def main():
         duration      = float(data['duration_per_segment'])
 
         T = len(q_real)
-        t = np.arange(T) * 0.01
+        t = np.arange(T) * 0.1
 
         for ax in [ax_traj, ax_q1, ax_q2, ax_dq1, ax_dq2, ax_tau]:
             ax.clear()

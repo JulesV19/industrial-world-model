@@ -73,7 +73,7 @@ def generate_shape_database(num_shapes=100):
         base_x, base_y = 1.0, 1.0
         scale = random.uniform(1.2, 1.6)
 
-        shape_type = random.choice(_SHAPE_NAMES)
+        shape_type = "SQUARE"
         pts = _SHAPE_FNS[shape_type](scale)
 
         # Rotation aléatoire — préserve la géométrie parfaite de la forme

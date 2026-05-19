@@ -76,7 +76,7 @@ def _get_split(save_dir, split, device):
     """Retourne (model, norm, H, full_ds, subset) pour le split demandé."""
     model, norm, H = _load(save_dir, device)
     with open(H["db_path"]) as f:
-        piece_db = json.load(f)
+        piece_db = json.load(f)["pieces"]
     episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
     full_ds = TrajectoryDataset(episode_paths, piece_db, normalizer=norm,
                                 target_keys=H.get("target_keys", None))
@@ -88,40 +88,99 @@ def _get_split(save_dir, split, device):
     return model, norm, H, full_ds, subset
 
 
-def _compute_loss_distribution(model, norm, H, full_ds, subset, device):
-    """Calcule la MSE loss (sur q) pour chaque épisode du subset.
-    Retourne un tableau numpy de shape (n_ep,)."""
-    losses = []
+def _compute_loss_distribution(model, norm, H, full_ds, subset, device,
+                               batch_size: int = 32):
+    """Calcule la MSE loss (sur q) pour chaque épisode — inférence batché."""
+    from torch.nn.utils.rnn import pad_sequence
+
     n_ep = len(subset)
     print(f"Calcul de la distribution des losses sur {n_ep} épisodes...")
-    for ep_idx in range(n_ep):
+
+    target_keys = H.get("target_keys") or [k for k, _ in METRIC_KEYS]
+    if isinstance(target_keys, str):
+        target_keys = [k.strip() for k in target_keys.split(",")]
+    q_col = 0
+    for k in target_keys:
+        if k in ("q_des", "q_real"):
+            break
+        q_col += dict(METRIC_KEYS)[k]
+
+    sf = max(1, int(H.get("subsample_factor", 1)))
+
+    losses = [float("nan")] * n_ep
+    start = 0
+    while start < n_ep:
+        end = min(start + batch_size, n_ep)
+        items = [subset[i] for i in range(start, end)]
+        B = len(items)
+
+        wps_list   = [it[0] for it in items]
+        speeds     = torch.stack([it[1] for it in items]).unsqueeze(1).to(device)  # (B,1)
+        obs_list   = [it[2] for it in items]
+        seq_lens   = [it[3] for it in items]
+        max_n_sub  = max(math.ceil(T / sf) for T in seq_lens)
+        max_W      = max(w.shape[0] for w in wps_list)
+
+        wps_t   = torch.zeros(B, max_W, 3, device=device)
+        wp_lens = torch.zeros(B, dtype=torch.long, device=device)
+        for k, w in enumerate(wps_list):
+            wps_t[k, :w.shape[0]] = w.to(device)
+            wp_lens[k] = w.shape[0]
+
         try:
-            pred, tgt, _, seq_len, q_col, _ = _run_inference(
-                model, norm, H, full_ds, subset, ep_idx, device)
-            mse = float(np.mean((pred[:seq_len, q_col:q_col+2]
-                                 - tgt[:seq_len, q_col:q_col+2]) ** 2))
+            with torch.no_grad():
+                pred_norm, _ = model(wps_t, wp_lens, speeds, max_len=max_n_sub)
+            pred_np = norm.denormalize_tensor(pred_norm).cpu().numpy()  # (B, max_n_sub, D)
+
+            for k in range(B):
+                T      = seq_lens[k]
+                n_sub  = math.ceil(T / sf)
+                seq_sub = math.ceil(T / sf)  # longueur réelle après sous-échantillonnage
+                tgt_sub = norm.denormalize(obs_list[k][::sf].numpy())  # (n_sub, D)
+                mse = float(np.mean(
+                    (pred_np[k, :seq_sub, q_col:q_col+2] - tgt_sub[:seq_sub, q_col:q_col+2]) ** 2
+                ))
+                losses[start + k] = mse
         except Exception:
-            mse = float("nan")
-        losses.append(mse)
-        if (ep_idx + 1) % max(1, n_ep // 10) == 0:
-            print(f"  {ep_idx + 1}/{n_ep}")
-    print("Distribution calculée.")
+            pass
+
+        print(f"  {end}/{n_ep}", end="\r")
+        start = end
+
+    print(f"\nDistribution calculée.")
     return np.array(losses)
+
+
+def _upsample(arr: np.ndarray, sf: int, T_full: int) -> np.ndarray:
+    """Interpole linéairement un tableau (n_sub, D) vers (T_full, D)."""
+    if sf <= 1:
+        return arr
+    n_sub = arr.shape[0]
+    sub_idx  = np.arange(n_sub) * sf
+    full_idx = np.arange(T_full)
+    return np.stack(
+        [np.interp(full_idx, sub_idx, arr[:, d]) for d in range(arr.shape[1])],
+        axis=1,
+    )
 
 
 def _run_inference(model, norm, H, full_ds, subset, ep_idx, device):
     """Inférence sur un épisode → (pred, tgt, waypoints, seq_len, q_col)."""
-    wps_t, obs_norm_t, seq_len = subset[ep_idx]
-    wps_t  = wps_t.unsqueeze(0).to(device)
-    wp_len = torch.tensor([wps_t.shape[1]]).to(device)
-    T      = obs_norm_t.shape[0]
+    wps_t, speed_t, obs_norm_t, seq_len = subset[ep_idx]
+    wps_t   = wps_t.unsqueeze(0).to(device)
+    wp_len  = torch.tensor([wps_t.shape[1]]).to(device)
+    speed   = speed_t.unsqueeze(0).unsqueeze(-1).to(device)   # (1, 1)
+    T       = obs_norm_t.shape[0]
+
+    sf      = max(1, int(H.get("subsample_factor", 1)))
+    n_steps = math.ceil(T / sf)
 
     with torch.no_grad():
-        pred_norm, _ = model(wps_t, wp_len, max_len=T)
-    pred_norm = pred_norm[0].cpu().numpy()
-    tgt_norm  = obs_norm_t.numpy()
+        pred_norm, _ = model(wps_t, wp_len, speed, max_len=n_steps)
+    pred_norm = pred_norm[0].cpu().numpy()   # (n_steps, D)
+    tgt_norm  = obs_norm_t.numpy()           # (T, D)
 
-    pred = norm.denormalize(pred_norm)
+    pred = _upsample(norm.denormalize(pred_norm), sf, T)
     tgt  = norm.denormalize(tgt_norm)
 
     target_keys = H.get("target_keys") or [k for k, _ in METRIC_KEYS]
@@ -129,10 +188,9 @@ def _run_inference(model, norm, H, full_ds, subset, ep_idx, device):
         target_keys = [k.strip() for k in target_keys.split(",")]
 
     if "is_cutting" in target_keys:
-        idx_cut = target_keys.index("is_cutting")
-        pred[:, idx_cut] = 1 / (1 + np.exp(-pred[:, idx_cut]))
-    elif not target_keys:
-        pred[:, BINARY_IDX] = 1 / (1 + np.exp(-pred[:, BINARY_IDX]))
+        ic  = target_keys.index("is_cutting")
+        col = sum(dict(METRIC_KEYS)[k] for k in target_keys[:ic])
+        pred[:, col] = 1 / (1 + np.exp(-pred[:, col]))
 
     orig_idx   = subset.indices[ep_idx] if hasattr(subset, "indices") else ep_idx
     waypoints  = full_ds.samples[orig_idx]["waypoints"]
@@ -294,7 +352,7 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
         m_vlines = []
         pred, tgt, seq_len = S["pred"], S["tgt"], S["seq_len"]
         target_keys = S["target_keys"]
-        t_ax = np.arange(seq_len) * 0.01
+        t_ax = np.arange(seq_len) * 0.1
         col, done = 0, 0
         for key in target_keys:
             dim = dict(METRIC_KEYS)[key]
@@ -323,14 +381,14 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
         frames = S["frames"]
         fi = max(0, min(fi, len(frames) - 1))
         i  = frames[fi]
-        t  = i * 0.01
+        t  = i * 0.1
         S["fi"] = fi
 
         line_true.set_data([0, S["elbow_t"][i, 0], S["tip_t"][i, 0]],
                            [0, S["elbow_t"][i, 1], S["tip_t"][i, 1]])
         line_pred.set_data([0, S["elbow_p"][i, 0], S["tip_p"][i, 0]],
                            [0, S["elbow_p"][i, 1], S["tip_p"][i, 1]])
-        s = max(0, i - 120)
+        s = max(0, i - 12)
         trace_true.set_data(S["tip_t"][s:i, 0], S["tip_t"][s:i, 1])
         trace_pred.set_data(S["tip_p"][s:i, 0], S["tip_p"][s:i, 1])
         time_text.set_text(f"t = {t:.2f} s")
@@ -450,7 +508,7 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
     ax_arm = fig.add_subplot(gs[:, 0])
     metric_axes = [fig.add_subplot(gs[i, 1]) for i in range(4)]
 
-    t_axis = np.arange(seq_len) * 0.01
+    t_axis = np.arange(seq_len) * 0.1
 
     arm_lim = L1 + L2 + 0.2
     ax_arm.set_xlim(-0.3, arm_lim); ax_arm.set_ylim(-0.3, arm_lim)
@@ -507,11 +565,11 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
             break
     metric_axes[-1].set_xlabel("t [s]", fontsize=8)
 
-    history_len = 120
+    history_len = 12
 
     def update(frame_idx):
         i = list(frames)[frame_idx]
-        t = i * 0.01
+        t = i * 0.1
         line_true.set_data([0, elbow_t[i, 0], tip_t[i, 0]],
                            [0, elbow_t[i, 1], tip_t[i, 1]])
         line_pred.set_data([0, elbow_p[i, 0], tip_p[i, 0]],

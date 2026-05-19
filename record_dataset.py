@@ -34,6 +34,8 @@ def record_episode(waypoints, duration):
     log_cut_deviation              = []
 
     episode_done = False
+    step_count = 0
+    SUBSAMPLE = 10  # simulation 100 Hz → log 10 Hz
 
     while not episode_done:
         if factory_state == "CUTTING":
@@ -69,15 +71,17 @@ def record_episode(waypoints, duration):
         else:
             cut_dev = 0.0
 
-        log_q_real.append(q_real.copy())
-        log_dq_real.append(state[2:4].copy())
-        log_q_sensed.append(q_sensed.copy())
-        log_dq_sensed.append(dq_sensed.copy())
-        log_tau.append(tau.copy())
-        log_q_des.append(q_des.copy())
-        log_dq_des.append(dq_des.copy())
-        log_is_cutting.append(1.0 if cutting else 0.0)
-        log_cut_deviation.append(cut_dev)
+        step_count += 1
+        if step_count % SUBSAMPLE == 0:
+            log_q_real.append(q_real.copy())
+            log_dq_real.append(state[2:4].copy())
+            log_q_sensed.append(q_sensed.copy())
+            log_dq_sensed.append(dq_sensed.copy())
+            log_tau.append(tau.copy())
+            log_q_des.append(q_des.copy())
+            log_dq_des.append(dq_des.copy())
+            log_is_cutting.append(1.0 if cutting else 0.0)
+            log_cut_deviation.append(cut_dev)
 
     cut_deviation = np.array(log_cut_deviation, dtype=np.float32)
     cut_defect    = (cut_deviation > CUT_DEFECT_THRESHOLD).astype(np.float32)

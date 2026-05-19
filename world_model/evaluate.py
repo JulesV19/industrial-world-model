@@ -46,11 +46,10 @@ def load_model(ckpt_path: str, device: torch.device):
     model = WorldModel(
         shape_embed_dim = H["shape_embed_dim"],
         h_dim           = H["h_dim"],
-        z_dim           = H["z_dim"],
         obs_dim         = H["obs_dim"],
         dropout         = 0.0,
-        free_bits       = H.get("free_bits", 0.5),
         gru_layers      = H.get("gru_layers", 3),
+        pe_dim          = H.get("pe_dim", 64),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -60,61 +59,74 @@ def load_model(ckpt_path: str, device: torch.device):
 
 # ── per-metric MSE in original (denormalised) units ───────────────────────────
 def compute_metrics(
-    preds_norm: np.ndarray,         # (T, 15)
-    targets_norm: np.ndarray,       # (T, 15)
-    seq_len: int,
-    normalizer: Normalizer,
+    preds_norm:   np.ndarray,   # (T, obs_dim)
+    targets_norm: np.ndarray,   # (T, obs_dim)
+    seq_len:      int,
+    normalizer:   Normalizer,
+    target_keys:  list[str],
 ) -> dict:
     p = normalizer.denormalize(preds_norm[:seq_len])
     t = normalizer.denormalize(targets_norm[:seq_len])
 
-    # Apply sigmoid to is_cutting prediction
-    p[:, BINARY_IDX] = 1 / (1 + np.exp(-p[:, BINARY_IDX]))
+    if "is_cutting" in target_keys:
+        ic = target_keys.index("is_cutting")
+        col = sum(dict(METRIC_KEYS)[k] for k in target_keys[:ic])
+        p[:, col] = 1 / (1 + np.exp(-p[:, col]))
 
     rmse = {}
-    for i, label in enumerate(_LABELS):
-        rmse[label] = float(np.sqrt(np.mean((p[:, i] - t[:, i]) ** 2)))
+    col = 0
+    for key in target_keys:
+        dim = dict(METRIC_KEYS)[key]
+        for j in range(dim):
+            lbl = f"{key}[{j}]" if dim > 1 else key
+            rmse[lbl] = float(np.sqrt(np.mean((p[:, col+j] - t[:, col+j]) ** 2)))
+        col += dim
     return rmse
 
 
 # ── plot one episode ───────────────────────────────────────────────────────────
 def plot_episode(
-    pred_norm: np.ndarray,
-    tgt_norm:  np.ndarray,
-    seq_len:   int,
-    normalizer: Normalizer,
+    pred_norm:   np.ndarray,
+    tgt_norm:    np.ndarray,
+    seq_len:     int,
+    normalizer:  Normalizer,
+    target_keys: list[str],
     episode_idx: int,
-    save_path: str | None = None,
+    save_path:   str | None = None,
 ):
     pred = normalizer.denormalize(pred_norm[:seq_len])
     tgt  = normalizer.denormalize(tgt_norm [:seq_len])
-    pred[:, BINARY_IDX] = 1 / (1 + np.exp(-pred[:, BINARY_IDX]))
 
-    t = np.arange(seq_len) * 0.01   # seconds (100 Hz)
+    if "is_cutting" in target_keys:
+        ic  = target_keys.index("is_cutting")
+        col = sum(dict(METRIC_KEYS)[k] for k in target_keys[:ic])
+        pred[:, col] = 1 / (1 + np.exp(-pred[:, col]))
 
-    # Group signals for plotting
-    groups = [
-        ("Joint angles — real  [rad]",    ["q_real[0]",    "q_real[1]"   ]),
-        ("Joint angles — sensed [rad]",   ["q_sensed[0]",  "q_sensed[1]" ]),
-        ("Joint angles — desired [rad]",  ["q_des[0]",     "q_des[1]"    ]),
-        ("Joint vel — real  [rad/s]",     ["dq_real[0]",   "dq_real[1]"  ]),
-        ("Joint vel — sensed [rad/s]",    ["dq_sensed[0]", "dq_sensed[1]"]),
-        ("Joint vel — desired [rad/s]",   ["dq_des[0]",    "dq_des[1]"   ]),
-        ("Torques [N·m]",                 ["tau[0]",        "tau[1]"      ]),
-        ("Is cutting",                    ["is_cutting"                   ]),
-    ]
+    t = np.arange(seq_len) * 0.1
 
-    n_rows = len(groups)
-    fig, axes = plt.subplots(n_rows, 1, figsize=(14, n_rows * 2.2), sharex=True)
+    _UNITS = {"q_real":"rad","q_des":"rad","q_sensed":"rad",
+              "dq_real":"rad/s","dq_des":"rad/s","dq_sensed":"rad/s",
+              "tau":"N·m","is_cutting":"prob"}
+
+    col, panels = 0, []
+    for key in target_keys:
+        dim = dict(METRIC_KEYS)[key]
+        for j in range(dim):
+            lbl = f"{key}[{j}]" if dim > 1 else key
+            panels.append((lbl, _UNITS.get(key, ""), col + j))
+        col += dim
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=(14, len(panels) * 2.2), sharex=True)
+    if len(panels) == 1:
+        axes = [axes]
     fig.suptitle(f"Episode {episode_idx + 1:03d} — World model prediction", fontsize=13)
 
-    for ax, (title, signals) in zip(axes, groups):
-        for sig in signals:
-            i = _LABELS.index(sig)
-            ax.plot(t, tgt [:, i], lw=1.2, label=f"{sig} (true)")
-            ax.plot(t, pred[:, i], lw=1.2, ls="--", label=f"{sig} (pred)")
-        ax.set_ylabel(title, fontsize=8)
-        ax.legend(fontsize=7, loc="upper right", ncol=2)
+    for ax, (lbl, unit, ci) in zip(axes, panels):
+        ax.plot(t, tgt [:, ci], lw=1.2, label=f"{lbl} (true)")
+        ax.plot(t, pred[:, ci], lw=1.2, ls="--", label=f"{lbl} (pred)", alpha=0.85)
+        ax.set_ylabel(unit, fontsize=8)
+        ax.set_title(lbl, fontsize=9)
+        ax.legend(fontsize=7, loc="upper right")
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel("Time [s]")
@@ -136,13 +148,17 @@ def evaluate(args: argparse.Namespace):
     norm_path  = os.path.join(save_dir, "normalizer.npz")
 
     model, H = load_model(ckpt_path, device)
-    normalizer = Normalizer.load(norm_path)
+    normalizer  = Normalizer.load(norm_path)
+    target_keys = H.get("target_keys") or [k for k, _ in METRIC_KEYS]
+    if isinstance(target_keys, str):
+        target_keys = [k.strip() for k in target_keys.split(",")]
 
     with open(H["db_path"]) as f:
         piece_db = json.load(f)["pieces"]
 
     episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
-    full_ds = TrajectoryDataset(episode_paths, piece_db, normalizer=normalizer)
+    full_ds = TrajectoryDataset(episode_paths, piece_db, normalizer=normalizer,
+                                target_keys=target_keys)
 
     # Reproduce the same train/val split as in training
     n_val   = max(1, int(len(full_ds) * H["val_split"]))
@@ -176,21 +192,21 @@ def evaluate(args: argparse.Namespace):
             tgt_np  = obs  [0].numpy()          # (T, 15)
             L       = int(seq_len[0])
 
-            rmse = compute_metrics(pred_np, tgt_np, L, normalizer)
+            rmse = compute_metrics(pred_np, tgt_np, L, normalizer, target_keys)
             all_rmse.append(rmse)
 
             if i in plot_indices:
                 orig_idx = val_ds.indices[i] if hasattr(val_ds, "indices") else i
                 plot_episode(
-                    pred_np, tgt_np, L, normalizer,
+                    pred_np, tgt_np, L, normalizer, target_keys,
                     episode_idx=orig_idx,
                     save_path=os.path.join(save_dir, "plots", f"episode_{orig_idx+1:03d}.png"),
                 )
 
     # ── aggregate RMSE report ──────────────────────────────────────────────
     print("\n── RMSE on validation set (original units) ──")
-    all_keys = _LABELS
-    for key in all_keys:
+    report_keys = list(all_rmse[0].keys()) if all_rmse else []
+    for key in report_keys:
         vals = [r[key] for r in all_rmse]
         print(f"  {key:<18s}  mean {np.mean(vals):.4f}   std {np.std(vals):.4f}")
 
@@ -198,7 +214,7 @@ def evaluate(args: argparse.Namespace):
 
 
 def _save_rmse_bar(all_rmse: list[dict], path: str):
-    labels = _LABELS
+    labels = list(all_rmse[0].keys()) if all_rmse else []
     means  = [np.mean([r[k] for r in all_rmse]) for k in labels]
     stds   = [np.std ([r[k] for r in all_rmse]) for k in labels]
 

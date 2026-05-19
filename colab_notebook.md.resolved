@@ -1,0 +1,101 @@
+# Cellules du Notebook Google Colab
+
+Voici le contenu exact et prêt à l'emploi de chaque cellule à exécuter dans votre notebook Google Colab. Vous pouvez copier-coller ces cellules une par une.
+
+> [!TIP]
+> Avant de commencer, assurez-vous d'avoir activé le GPU : **Exécution** > **Modifier le type d'exécution** > **T4 GPU** (ou supérieur).
+
+---
+
+### Cellule 1 : Vérification de l'accélérateur GPU
+*Cette cellule permet de vérifier que le GPU de Colab est bien détecté par PyTorch.*
+
+```python
+import torch
+
+cuda_avail = torch.cuda.is_available()
+print("GPU disponible :", cuda_avail)
+if cuda_avail:
+    print("Modèle du GPU :", torch.cuda.get_device_name(0))
+else:
+    print("⚠️ ATTENTION : Le GPU n'est pas actif. Allez dans 'Modifier le type d'exécution' pour l'activer.")
+```
+
+---
+
+### Cellule 2 : Cloner votre dépôt GitHub
+*Remplacez l'URL par celle de votre dépôt. Si votre dépôt est **privé**, utilisez un Personal Access Token (PAT) GitHub comme indiqué ci-dessous.*
+
+```bash
+# Pour un dépôt PUBLIC :
+!git clone https://github.com/<votre-pseudo-github>/<nom-du-repo>.git
+
+# Pour un dépôt PRIVÉ (décommentez et remplacez par vos identifiants) :
+# !git clone https://<votre-pseudo-github>:<votre-token-pat-github>@github.com/<votre-pseudo-github>/<nom-du-repo>.git
+
+# Se positionner dans le dossier du projet
+%cd <nom-du-repo>
+```
+
+---
+
+### Cellule 3 : Monter Google Drive
+*Colab vous demandera une autorisation d'accès à votre compte Google Drive. Acceptez pour pouvoir accéder à votre fichier `dataset.zip`.*
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+---
+
+### Cellule 4 : Copier et décompresser le dataset sur le disque local de Colab
+*Cette cellule copie l'archive de votre dataset depuis votre Drive et la décompresse en local sur l'instance Colab en quelques secondes (gain de temps maximal sur les I/O).*
+
+```bash
+# 1. Copier le fichier zip depuis la racine de votre Google Drive (à adapter si vous l'avez mis dans un dossier)
+!cp /content/drive/MyDrive/dataset.zip .
+
+# 2. Décompresser silencieusement l'archive dans le dossier du projet
+!unzip -q dataset.zip
+
+# 3. Vérifier que les fichiers ont bien été extraits
+print("✓ Vérification des fichiers extraits :")
+!ls -lh pieces_database.json
+print("Nombre d'épisodes extraits dans dataset/ :")
+!ls dataset | wc -l
+```
+
+---
+
+### Cellule 5 : Installer les dépendances
+*Installe le contenu de votre fichier `requirements.txt`.*
+
+```bash
+!pip install -r requirements.txt
+```
+
+---
+
+### Cellule 6 : Lancer l'entraînement du modèle
+*Cette cellule lance le script d'entraînement sur le GPU. Vous pouvez surcharger les hyperparamètres (comme `--batch_size 64` pour maximiser l'utilisation du GPU).*
+
+```bash
+!python3 -m world_model.train --epochs 300 --batch_size 64
+```
+
+---
+
+### Cellule 7 : Compresser et sauvegarder les résultats sur votre Google Drive
+*Une fois l'entraînement terminé, cette cellule rassemble les checkpoints du modèle et les courbes d'apprentissage, puis les sauvegarde sur votre Drive pour éviter qu'ils ne soient perdus à l'extinction de Colab.*
+
+```bash
+# 1. Compresser le dossier des checkpoints et des courbes d'apprentissage
+!zip -r checkpoints.zip world_model/checkpoints/
+
+# 2. Copier l'archive sur Google Drive
+!cp checkpoints.zip /content/drive/MyDrive/
+
+print("🎉 Sauvegarde terminée avec succès !")
+print("Vous pouvez maintenant télécharger 'checkpoints.zip' depuis votre Google Drive et le décompresser sur votre Mac.")
+```
