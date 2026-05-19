@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from .dataset import BINARY_IDX, CONTINUOUS_SLICE, TrajectoryDataset, collate_fn
+from .dataset import TrajectoryDataset, collate_fn, target_dim
 from .model import WorldModel
 
 # ── default hyperparameters ────────────────────────────────────────────────────
@@ -28,21 +28,18 @@ DEFAULTS = dict(
     early_stopping  = 40,
     shape_embed_dim = 256,
     h_dim           = 512,
-    z_dim           = 64,       # conservé pour compatibilité CLI, non utilisé
-    obs_dim         = 15,
+    obs_dim         = 2,        # déterminé automatiquement depuis target_keys
     dropout         = 0.1,
-    free_bits       = 0.5,      # idem
     gru_layers      = 3,
-    pe_dim          = 64,       # dimension de l'encodage positionnel
+    pe_dim          = 64,
     lr              = 3e-4,
     weight_decay    = 1e-4,
-    beta_kl         = 0.0,      # plus de KL (modèle déterministe)
-    kl_warmup       = 1,
     batch_size      = 64,
     epochs          = 300,
     grad_clip       = 5.0,
     val_split       = 0.1,
     seed            = 42,
+    target_keys     = "q_des",  # signaux à prédire (séparés par virgule)
     save_dir        = "world_model/checkpoints",
     data_dir        = "dataset",
     db_path         = "pieces_database.json",
@@ -54,34 +51,14 @@ def compute_loss(
     preds: torch.Tensor,
     targets: torch.Tensor,
     seq_lengths: torch.Tensor,
-    kl_loss: torch.Tensor,
-    beta: float,
 ):
-    """
-    preds       : (B, T, 15) — raw decoder output
-    targets     : (B, T, 15) — normalised observations
-    seq_lengths : (B,)        — actual lengths (rest is padding)
-    """
-    B, T, _ = preds.shape
-    device   = preds.device
-
-    mask = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
-    n    = mask.sum() + 1e-8
-
-    # Continuous signals — MSE in normalised space
-    mse = ((preds[..., CONTINUOUS_SLICE] - targets[..., CONTINUOUS_SLICE]).pow(2)
-           * mask[..., None]).sum() / (n * 14)
-
-    # is_cutting — BCE with logits (targets are already 0 / 1)
-    bce = nn.functional.binary_cross_entropy_with_logits(
-        preds[..., BINARY_IDX],
-        targets[..., BINARY_IDX],
-        reduction="none",
-    )
-    bce = (bce * mask).sum() / n
-
-    total = mse + bce + beta * kl_loss
-    return total, mse, bce, kl_loss
+    """MSE masqué sur tous les signaux cibles (continus normalisés)."""
+    B, T, D = preds.shape
+    device  = preds.device
+    mask    = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
+    n       = mask.sum() * D + 1e-8
+    mse     = ((preds - targets).pow(2) * mask[..., None]).sum() / n
+    return mse
 
 
 # ── device ─────────────────────────────────────────────────────────────────────
@@ -109,7 +86,15 @@ def train(cfg: dict | None = None):
 
     os.makedirs(H["save_dir"], exist_ok=True)
 
-    full_ds = TrajectoryDataset(episode_paths, piece_db)
+    # Signaux cibles : liste depuis la chaîne CLI "q_des" ou "q_des,q_real" etc.
+    raw_keys = H.get("target_keys", "q_des")
+    target_keys = [k.strip() for k in raw_keys.split(",")] if isinstance(raw_keys, str) else raw_keys
+    obs_dim = target_dim(target_keys)
+    H["obs_dim"]     = obs_dim
+    H["target_keys"] = target_keys
+    print(f"Signaux cibles : {target_keys}  →  obs_dim={obs_dim}")
+
+    full_ds = TrajectoryDataset(episode_paths, piece_db, target_keys=target_keys)
     full_ds.normalizer.save(os.path.join(H["save_dir"], "normalizer.npz"))
 
     n_val   = max(1, int(len(full_ds) * H["val_split"]))
@@ -131,10 +116,8 @@ def train(cfg: dict | None = None):
     model = WorldModel(
         shape_embed_dim = H["shape_embed_dim"],
         h_dim           = H["h_dim"],
-        z_dim           = H["z_dim"],
         obs_dim         = H["obs_dim"],
         dropout         = H["dropout"],
-        free_bits       = H["free_bits"],
         gru_layers      = H["gru_layers"],
         pe_dim          = H.get("pe_dim", 64),
     ).to(device)
@@ -148,7 +131,7 @@ def train(cfg: dict | None = None):
     scheduler = CosineAnnealingLR(optimizer, T_max=H["epochs"], eta_min=1e-5)
 
     best_val      = float("inf")
-    history       = dict(train=[], val=[], mse=[], bce=[], kl=[], lr=[], grad_norm=[])
+    history       = dict(train=[], val=[], lr=[], grad_norm=[])
     epochs_no_imp = 0
     t_start       = time.time()
 
@@ -156,12 +139,11 @@ def train(cfg: dict | None = None):
     epoch_bar = tqdm(range(1, H["epochs"] + 1), desc="Training", unit="epoch")
 
     for epoch in epoch_bar:
-        beta = H["beta_kl"] * min(1.0, epoch / max(1, H["kl_warmup"]))
         t_epoch = time.time()
 
         # --- train ---
         model.train()
-        train_total = train_mse = train_bce = train_kl = 0.0
+        train_total     = 0.0
         total_grad_norm = 0.0
 
         batch_bar = tqdm(
@@ -175,104 +157,66 @@ def train(cfg: dict | None = None):
             obs, seq_len = obs.to(device), seq_len.to(device)
 
             optimizer.zero_grad()
-            preds, kl = model(wps, wp_len, targets=obs)
-            loss, mse, bce, kl_val = compute_loss(preds, obs, seq_len, kl, beta)
+            preds, _ = model(wps, wp_len, targets=obs)
+            loss     = compute_loss(preds, obs, seq_len)
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
             optimizer.step()
 
-            train_total    += loss.item()
-            train_mse      += mse.item()
-            train_bce      += bce.item()
-            train_kl       += kl_val.item()
+            train_total     += loss.item()
             total_grad_norm += grad_norm.item()
 
-            batch_bar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                mse=f"{mse.item():.4f}",
-                bce=f"{bce.item():.4f}",
-                kl=f"{kl_val.item():.4f}",
-            )
+            batch_bar.set_postfix(mse=f"{loss.item():.4f}")
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         # --- validate ---
         model.eval()
-        val_total = val_mse = val_bce = val_kl_acc = 0.0
+        val_total = 0.0
         with torch.no_grad():
             for wps, wp_len, obs, seq_len in val_loader:
                 wps, wp_len  = wps.to(device), wp_len.to(device)
                 obs, seq_len = obs.to(device), seq_len.to(device)
-                preds, kl = model(wps, wp_len, targets=obs)
-                loss, mse, bce, kl_val = compute_loss(preds, obs, seq_len, kl, beta)
-                val_total  += loss.item()
-                val_mse    += mse.item()
-                val_bce    += bce.item()
-                val_kl_acc += kl_val.item()
+                preds, _     = model(wps, wp_len, targets=obs)
+                val_total   += compute_loss(preds, obs, seq_len).item()
 
-        n_train_b = len(train_loader)
-        n_val_b   = len(val_loader)
-
-        avg_train     = train_total    / n_train_b
-        avg_train_mse = train_mse      / n_train_b
-        avg_train_bce = train_bce      / n_train_b
-        avg_train_kl  = train_kl       / n_train_b
-        avg_grad_norm = total_grad_norm / n_train_b
-        avg_val       = val_total      / n_val_b
-        avg_mse       = val_mse        / n_val_b
-        avg_bce       = val_bce        / n_val_b
-        avg_kl        = val_kl_acc     / n_val_b
+        avg_train     = train_total     / len(train_loader)
+        avg_val       = val_total       / len(val_loader)
+        avg_grad_norm = total_grad_norm / len(train_loader)
         epoch_time    = time.time() - t_epoch
         elapsed       = time.time() - t_start
         eta           = elapsed / epoch * (H["epochs"] - epoch)
 
         history["train"    ].append(avg_train)
         history["val"      ].append(avg_val)
-        history["mse"      ].append(avg_mse)
-        history["bce"      ].append(avg_bce)
-        history["kl"       ].append(avg_kl)
         history["lr"       ].append(current_lr)
         history["grad_norm"].append(avg_grad_norm)
 
-        # Critère de suivi = reconstruction seule (MSE + BCE), sans le terme KL*β
-        # qui augmente artificiellement pendant le warm-up et fausserait l'early stopping.
-        val_recon = avg_mse + avg_bce
-        improved = val_recon < best_val
+        improved = avg_val < best_val
         if improved:
-            best_val      = val_recon
+            best_val      = avg_val
             epochs_no_imp = 0
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "hyperparams": H,
-                    "val_loss": val_recon,
+                    "val_loss": avg_val,
                 },
                 os.path.join(H["save_dir"], "best_model.pt"),
             )
         else:
             epochs_no_imp += 1
 
-        # Update outer bar suffix with key metrics
-        epoch_bar.set_postfix(
-            recon=f"{val_recon:.4f}",
-            best=f"{best_val:.4f}",
-            mse=f"{avg_mse:.4f}",
-            bce=f"{avg_bce:.4f}",
-            kl=f"{avg_kl:.4f}",
-            lr=f"{current_lr:.2e}",
-        )
-
-        # Detailed line every epoch (below the bars)
         marker = " ★" if improved else f" ({epochs_no_imp})"
+        epoch_bar.set_postfix(
+            val=f"{avg_val:.4f}", best=f"{best_val:.4f}", lr=f"{current_lr:.2e}"
+        )
         tqdm.write(
             f"[{epoch:3d}/{H['epochs']}] {epoch_time:5.1f}s  ETA {_fmt_time(eta)}  "
-            f"β={beta:.3f}  lr={current_lr:.2e}  ‖g‖={avg_grad_norm:.2f}\n"
-            f"         train  loss={avg_train:.4f}  mse={avg_train_mse:.4f}  "
-            f"bce={avg_train_bce:.4f}  kl={avg_train_kl:.4f}\n"
-            f"         val    loss={avg_val:.4f}  mse={avg_mse:.4f}  "
-            f"bce={avg_bce:.4f}  kl={avg_kl:.4f}{marker}"
+            f"lr={current_lr:.2e}  ‖g‖={avg_grad_norm:.2f}  "
+            f"train={avg_train:.4f}  val={avg_val:.4f}{marker}"
         )
 
         # Early stopping
@@ -296,27 +240,20 @@ def _fmt_time(seconds: float) -> str:
 
 
 def _save_curves(history: dict, save_dir: str):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    ax = axes[0, 0]
+    ax = axes[0]
     ax.plot(history["train"], label="Train")
     ax.plot(history["val"],   label="Val")
-    ax.set_title("Total loss (log)"); ax.legend(); ax.set_xlabel("Epoch")
+    ax.set_title("MSE loss (log)"); ax.legend(); ax.set_xlabel("Epoch")
     ax.set_yscale("log"); ax.grid(True, alpha=0.3)
 
-    ax = axes[0, 1]
-    ax.plot(history["mse"], label="MSE")
-    ax.plot(history["bce"], label="BCE")
-    ax.plot(history["kl"],  label="KL")
-    ax.set_title("Val loss components"); ax.legend(); ax.set_xlabel("Epoch")
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 0]
+    ax = axes[1]
     ax.plot(history["lr"])
     ax.set_title("Learning rate"); ax.set_xlabel("Epoch")
     ax.set_yscale("log"); ax.grid(True, alpha=0.3)
 
-    ax = axes[1, 1]
+    ax = axes[2]
     ax.plot(history["grad_norm"])
     ax.set_title("Gradient norm (avg per epoch)"); ax.set_xlabel("Epoch")
     ax.grid(True, alpha=0.3)
@@ -332,7 +269,7 @@ def _save_curves(history: dict, save_dir: str):
 def _parse_args():
     p = argparse.ArgumentParser()
     for k, v in DEFAULTS.items():
-        p.add_argument(f"--{k}", type=type(v), default=v)
+        p.add_argument(f"--{k}", type=str if k == "target_keys" else type(v), default=v)
     return vars(p.parse_args())
 
 
