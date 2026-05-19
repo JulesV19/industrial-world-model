@@ -48,7 +48,7 @@ class SinusoidalPE(nn.Module):
     vers un point fixe → sorties constantes ou aléatoires.
     """
 
-    def __init__(self, dim: int, max_len: int = 2000):
+    def __init__(self, dim: int, max_len: int = 4000):
         super().__init__()
         pe       = torch.zeros(max_len, dim)
         position = torch.arange(max_len).unsqueeze(1).float()
