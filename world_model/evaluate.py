@@ -139,7 +139,7 @@ def evaluate(args: argparse.Namespace):
     normalizer = Normalizer.load(norm_path)
 
     with open(H["db_path"]) as f:
-        piece_db = json.load(f)
+        piece_db = json.load(f)["pieces"]
 
     episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
     full_ds = TrajectoryDataset(episode_paths, piece_db, normalizer=normalizer)
@@ -166,10 +166,11 @@ def evaluate(args: argparse.Namespace):
     os.makedirs(os.path.join(save_dir, "plots"), exist_ok=True)
 
     with torch.no_grad():
-        for i, (wps, wp_len, obs, seq_len) in enumerate(val_loader):
+        for i, (wps, wp_len, speed, obs, seq_len) in enumerate(val_loader):
             wps, wp_len = wps.to(device), wp_len.to(device)
+            speed       = speed.to(device)
             T = obs.shape[1]
-            preds, _ = model(wps, wp_len, max_len=T)   # prior rollout
+            preds, _ = model(wps, wp_len, speed, max_len=T)
 
             pred_np = preds[0].cpu().numpy()    # (T, 15)
             tgt_np  = obs  [0].numpy()          # (T, 15)

@@ -105,7 +105,7 @@ class TemporalDecoder(nn.Module):
         self.h_dim      = h_dim
         self.gru_layers = gru_layers
 
-        self.pe = SinusoidalPE(pe_dim)
+        self.pe = SinusoidalPE(pe_dim, max_len=20000)
 
         gru_input = shape_embed_dim + pe_dim
         self.gru  = nn.GRU(gru_input, h_dim, num_layers=gru_layers,
@@ -166,22 +166,31 @@ class WorldModel(nn.Module):
         pe_dim:          int   = 64,
     ):
         super().__init__()
-        self.encoder = ShapeEncoder(embed_dim=shape_embed_dim, dropout=dropout)
+        self.encoder    = ShapeEncoder(embed_dim=shape_embed_dim, dropout=dropout)
+        self.speed_proj = nn.Sequential(
+            nn.Linear(1, shape_embed_dim),
+            nn.GELU(),
+            nn.Linear(shape_embed_dim, shape_embed_dim),
+        )
         self.decoder = TemporalDecoder(
             shape_embed_dim=shape_embed_dim,
             h_dim=h_dim, obs_dim=obs_dim,
             pe_dim=pe_dim, gru_layers=gru_layers, dropout=dropout,
         )
 
-    def forward(self, waypoints, wp_lengths, targets=None, max_len=1300):
+    def forward(self, waypoints, wp_lengths, speed, targets=None, max_len=1300):
+        """
+        speed : (B, 1) float — duration_per_segment en secondes
+        """
         shape_embed = self.encoder(waypoints, wp_lengths)
+        shape_embed = shape_embed + self.speed_proj(speed)
         T = targets.shape[1] if targets is not None else max_len
         preds = self.decoder(shape_embed, T)
-        # Retourne (preds, kl=0) pour garder la même interface
         return preds, torch.tensor(0.0, device=preds.device)
 
     @torch.no_grad()
-    def predict(self, waypoints, wp_lengths, max_len=1300):
+    def predict(self, waypoints, wp_lengths, speed, max_len=1300):
         self.eval()
         shape_embed = self.encoder(waypoints, wp_lengths)
+        shape_embed = shape_embed + self.speed_proj(speed)
         return self.decoder(shape_embed, max_len)

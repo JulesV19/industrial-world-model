@@ -7,7 +7,7 @@ from config import (
     ripple_amplitude, gain_error_std, motor_noise_std, deadband_torque,
     encoder_resolution, sensor_noise_q_std, sensor_noise_dq_std,
     sensor_glitch_prob, sensor_glitch_q_std, sensor_glitch_dq_std,
-    Kp_gain, Kd_gain, alpha_filter
+    Kp_gain, Kd_gain, alpha_filter, vel_noise_scale_k
 )
 
 class PhysicsArmEnv:
@@ -71,17 +71,18 @@ class PhysicsArmEnv:
     def read_sensors(self):
         q_real, dq_real = self.state[0:2], self.state[2:4]
         encoder_res = (2 * math.pi) / encoder_resolution
-        
-        # Bruit de mesure continu
-        q_noisy = q_real + np.random.normal(0, sensor_noise_q_std, 2)
-        dq_noisy = dq_real + np.random.normal(0, sensor_noise_dq_std, 2)
-        
+
+        # À haute vitesse articulaire, chaque tick encodeur couvre un plus grand angle
+        # et l'estimation de vitesse par différences finies se dégrade → bruit scalé par ||dq||
+        vel_scale = 1.0 + vel_noise_scale_k * np.linalg.norm(dq_real)
+
+        q_noisy = q_real + np.random.normal(0, sensor_noise_q_std * vel_scale, 2)
+        dq_noisy = dq_real + np.random.normal(0, sensor_noise_dq_std * vel_scale, 2)
+
         # Quantification liée à la résolution de l'encodeur optique
         q_sensed = np.round(q_noisy / encoder_res) * encoder_res
-        
-        # GLITCH CAPTEUR (Non-déterministe, Observation Noise ponctuel)
-        # Pour forcer le World Model à apprendre à ignorer les aberrations (outliers)
-        if np.random.random() < sensor_glitch_prob:  # Probabilité d'avoir un glitch sur la trame capteur
+
+        if np.random.random() < sensor_glitch_prob:
             q_sensed += np.random.normal(0, sensor_glitch_q_std, 2)
             dq_noisy += np.random.normal(0, sensor_glitch_dq_std, 2)
 

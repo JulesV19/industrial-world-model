@@ -33,6 +33,7 @@ sensor_noise_dq_std = 0.008
 sensor_glitch_prob = 0.001  # Probabilité d'avoir un pic de bruit aberrant
 sensor_glitch_q_std = 0.05
 sensor_glitch_dq_std = 0.5
+vel_noise_scale_k = 0.4    # Amplification du bruit capteur par rad/s de vitesse articulaire
 
 # --- CONTRÔLEUR ---
 Kp_gain = 1200.0

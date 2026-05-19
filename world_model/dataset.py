@@ -118,8 +118,9 @@ class TrajectoryDataset(Dataset):
             data      = np.load(ep_path)
             obs       = build_obs_vector(data, target_keys)
             waypoints = np.array(piece_db[idx], dtype=np.float32)
+            speed     = float(data["duration_per_segment"])
             raw_trajs.append(obs)
-            meta.append((waypoints, len(obs)))
+            meta.append((waypoints, speed, len(obs)))
 
         if normalizer is None:
             normalizer = Normalizer()
@@ -127,9 +128,10 @@ class TrajectoryDataset(Dataset):
         self.normalizer = normalizer
 
         self.samples = []
-        for (waypoints, seq_len), obs in zip(meta, raw_trajs):
+        for (waypoints, speed, seq_len), obs in zip(meta, raw_trajs):
             self.samples.append({
                 "waypoints": waypoints,
+                "speed":     np.float32(speed),
                 "obs":       normalizer.normalize(obs),
                 "length":    seq_len,
             })
@@ -141,6 +143,7 @@ class TrajectoryDataset(Dataset):
         s = self.samples[idx]
         return (
             torch.from_numpy(s["waypoints"]),
+            torch.tensor(s["speed"]),
             torch.from_numpy(s["obs"]),
             s["length"],
         )
@@ -148,10 +151,11 @@ class TrajectoryDataset(Dataset):
 
 # ---------------------------------------------------------------------------
 def collate_fn(batch):
-    waypoints_list, obs_list, lengths = zip(*batch)
+    waypoints_list, speeds, obs_list, lengths = zip(*batch)
     return (
         pad_sequence(waypoints_list, batch_first=True, padding_value=0.0),
         torch.tensor([w.shape[0] for w in waypoints_list]),
+        torch.stack(speeds).unsqueeze(-1),          # (B, 1)
         pad_sequence(obs_list, batch_first=True, padding_value=0.0),
         torch.tensor(lengths),
     )

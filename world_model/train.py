@@ -34,12 +34,12 @@ DEFAULTS = dict(
     pe_dim          = 64,
     lr              = 3e-4,
     weight_decay    = 1e-4,
-    batch_size      = 64,
+    batch_size      = 32,
     epochs          = 300,
     grad_clip       = 5.0,
     val_split       = 0.1,
     seed            = 42,
-    target_keys     = "q_des",  # signaux à prédire (séparés par virgule)
+    target_keys     = "q_real",  # signaux à prédire (séparés par virgule)
     save_dir        = "world_model/checkpoints",
     data_dir        = "dataset",
     db_path         = "pieces_database.json",
@@ -79,15 +79,16 @@ def train(cfg: dict | None = None):
 
     # ── data ──────────────────────────────────────────────────────────────────
     with open(H["db_path"]) as f:
-        piece_db = json.load(f)
+        db_json  = json.load(f)
+    piece_db = db_json["pieces"]
 
     episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
     print(f"Episodes : {len(episode_paths)}")
 
     os.makedirs(H["save_dir"], exist_ok=True)
 
-    # Signaux cibles : liste depuis la chaîne CLI "q_des" ou "q_des,q_real" etc.
-    raw_keys = H.get("target_keys", "q_des")
+    # Signaux cibles : liste depuis la chaîne CLI "q_real" ou "q_real,q_des" etc.
+    raw_keys = H.get("target_keys", "q_real")
     target_keys = [k.strip() for k in raw_keys.split(",")] if isinstance(raw_keys, str) else raw_keys
     obs_dim = target_dim(target_keys)
     H["obs_dim"]     = obs_dim
@@ -102,15 +103,16 @@ def train(cfg: dict | None = None):
     g       = torch.Generator().manual_seed(H["seed"])
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
 
+    pin = device.type == "cuda"
     train_loader = DataLoader(
         train_ds, batch_size=H["batch_size"],
         shuffle=True, collate_fn=collate_fn,
-        num_workers=4, pin_memory=True,
+        num_workers=0, pin_memory=pin,
     )
     val_loader = DataLoader(
         val_ds, batch_size=H["batch_size"],
         shuffle=False, collate_fn=collate_fn,
-        num_workers=4, pin_memory=True,
+        num_workers=0, pin_memory=pin,
     )
     print(f"Train : {n_train}  |  Val : {n_val}")
 
@@ -154,12 +156,13 @@ def train(cfg: dict | None = None):
             leave=False,
             unit="batch",
         )
-        for wps, wp_len, obs, seq_len in batch_bar:
+        for wps, wp_len, speed, obs, seq_len in batch_bar:
             wps, wp_len  = wps.to(device), wp_len.to(device)
+            speed        = speed.to(device)
             obs, seq_len = obs.to(device), seq_len.to(device)
 
             optimizer.zero_grad()
-            preds, _ = model(wps, wp_len, targets=obs)
+            preds, _ = model(wps, wp_len, speed, targets=obs)
             loss     = compute_loss(preds, obs, seq_len)
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
@@ -177,10 +180,11 @@ def train(cfg: dict | None = None):
         model.eval()
         val_total = 0.0
         with torch.no_grad():
-            for wps, wp_len, obs, seq_len in val_loader:
+            for wps, wp_len, speed, obs, seq_len in val_loader:
                 wps, wp_len  = wps.to(device), wp_len.to(device)
+                speed        = speed.to(device)
                 obs, seq_len = obs.to(device), seq_len.to(device)
-                preds, _     = model(wps, wp_len, targets=obs)
+                preds, _     = model(wps, wp_len, speed, targets=obs)
                 val_total   += compute_loss(preds, obs, seq_len).item()
 
         avg_train     = train_total     / len(train_loader)
