@@ -25,27 +25,28 @@ from .model import WorldModel
 
 # ── default hyperparameters ────────────────────────────────────────────────────
 DEFAULTS = dict(
-    early_stopping  = 40,
-    shape_embed_dim = 256,
-    h_dim           = 512,
-    obs_dim         = 2,        # déterminé automatiquement depuis target_keys
-    dropout         = 0.1,
-    gru_layers      = 3,
-    pe_dim          = 64,
-    lr              = 3e-4,
-    weight_decay    = 1e-4,
-    batch_size      = 32,
-    epochs          = 100,
-    grad_clip       = 5.0,
-    val_split       = 0.1,
-    seed            = 42,
-    num_workers     = 0,        # 0 = optimal : dataset entièrement pré-chargé en RAM
-    subsample_factor= 1,        # sous-échantillonnage temporel (ex: 10 = 1 step sur 10)
-    use_amp         = True,     # mixed precision BF16 (A100/T4 uniquement)
-    target_keys     = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
-    save_dir        = "world_model/checkpoints",
-    data_dir        = "dataset",
-    db_path         = "pieces_database.json",
+    early_stopping       = 40,
+    shape_embed_dim      = 256,
+    h_dim                = 512,
+    obs_dim              = 2,        # déterminé automatiquement depuis target_keys
+    dropout              = 0.1,
+    gru_layers           = 3,
+    pe_dim               = 64,
+    lr                   = 3e-4,
+    weight_decay         = 1e-4,
+    batch_size           = 32,
+    epochs               = 100,
+    grad_clip            = 5.0,
+    val_split            = 0.1,
+    seed                 = 42,
+    num_workers          = 0,        # 0 = optimal : dataset entièrement pré-chargé en RAM
+    subsample_factor     = 1,        # sous-échantillonnage temporel (ex: 10 = 1 step sur 10)
+    use_amp              = True,     # mixed precision BF16 (A100/T4 uniquement)
+    target_keys          = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
+    error_weight_gamma   = 1.0,      # pondération par amplitude d'erreur : 0=désactivé, 1=linéaire, 2=quadratique
+    save_dir             = "world_model/checkpoints",
+    data_dir             = "dataset",
+    db_path              = "pieces_database.json",
 )
 
 
@@ -54,13 +55,33 @@ def compute_loss(
     preds: torch.Tensor,
     targets: torch.Tensor,
     seq_lengths: torch.Tensor,
+    error_weight_gamma: float = 0.0,
 ):
-    """MSE masqué sur tous les signaux cibles (continus normalisés)."""
+    """MSE masqué, avec pondération optionnelle par amplitude des targets.
+
+    error_weight_gamma=0  → MSE classique
+    error_weight_gamma=1  → chaque séquence est pondérée proportionnellement
+                            au RMS de ses targets (séquences très erronées ×γ plus)
+    error_weight_gamma=2  → pondération quadratique, encore plus agressive
+    """
     B, T, D = preds.shape
     device  = preds.device
-    mask    = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
-    n       = mask.sum() * D + 1e-8
-    mse     = ((preds - targets).pow(2) * mask[..., None]).sum() / n
+    mask    = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()  # [B, T]
+
+    if error_weight_gamma > 0.0:
+        # RMS des targets par séquence → proxy de l'amplitude d'erreur
+        seq_rms = (targets.pow(2) * mask[..., None]).sum(dim=(1, 2))   # [B]
+        seq_rms = seq_rms / (mask.sum(dim=1) * D + 1e-8)               # moyenne par step
+        seq_rms = seq_rms.sqrt()                                        # [B]
+        # Poids normalisés (mean=1 dans le batch pour stabiliser la magnitude de la loss)
+        w = seq_rms.pow(error_weight_gamma)
+        w = w / (w.mean() + 1e-8)                                      # [B]
+        w = w[:, None, None]                                            # [B, 1, 1]
+    else:
+        w = 1.0
+
+    n   = mask.sum() * D + 1e-8
+    mse = ((preds - targets).pow(2) * mask[..., None] * w).sum() / n
     return mse
 
 
@@ -178,7 +199,7 @@ def train(cfg: dict | None = None):
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 preds, _ = model(wps, wp_len, speed, targets=obs)
-                loss     = compute_loss(preds, obs, seq_len)
+                loss     = compute_loss(preds, obs, seq_len, H["error_weight_gamma"])
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
@@ -205,7 +226,7 @@ def train(cfg: dict | None = None):
                     seq_len = (seq_len + sf - 1) // sf
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     preds, _ = model(wps, wp_len, speed, targets=obs)
-                    val_total += compute_loss(preds, obs, seq_len).item()
+                    val_total += compute_loss(preds, obs, seq_len, H["error_weight_gamma"]).item()
 
         avg_train     = train_total     / len(train_loader)
         avg_val       = val_total       / len(val_loader)

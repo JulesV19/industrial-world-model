@@ -16,7 +16,7 @@ HISTORY_LEN = 300
 
 # --- IMPERFECTIONS PHYSIQUES ET BRUIT ---
 # Frottements
-visc_friction_coeffs = [2.5, 1.5]
+visc_friction_coeffs = [2.5*2, 1.5*2]
 coulomb_friction_coeffs = [5.0, 3.0]
 stribeck_friction_coeffs = [8.0, 5.0]
 
@@ -28,7 +28,7 @@ deadband_torque = 1.5      # Zone morte (couple minimum pour bouger)
 
 # Capteurs
 encoder_resolution = 8192
-sensor_noise_q_std = 0.0002
+sensor_noise_q_std = 0.002
 sensor_noise_dq_std = 0.008
 sensor_glitch_prob = 0.001  # Probabilité d'avoir un pic de bruit aberrant
 sensor_glitch_q_std = 0.05

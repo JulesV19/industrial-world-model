@@ -76,9 +76,6 @@ def generate_shape_database(num_shapes=100):
         shape_type = "SQUARE"
         pts = _SHAPE_FNS[shape_type](scale)
 
-        # Rotation aléatoire — préserve la géométrie parfaite de la forme
-        pts = _rotate(pts, random.uniform(0, 2*math.pi))
-
         pts = _clamp_to_workspace(pts, base_x, base_y)
 
         _HOME = (0.1, 0.1)
