@@ -39,6 +39,7 @@ DEFAULTS = dict(
     grad_clip       = 5.0,
     val_split       = 0.1,
     seed            = 42,
+    num_workers     = 4,        # workers DataLoader (0 = main thread, goulot d'étranglement CPU)
     target_keys     = "q_real",  # signaux à prédire (séparés par virgule)
     save_dir        = "world_model/checkpoints",
     data_dir        = "dataset",
@@ -103,16 +104,19 @@ def train(cfg: dict | None = None):
     g       = torch.Generator().manual_seed(H["seed"])
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
 
-    pin = device.type == "cuda"
+    nw  = H["num_workers"]
+    pin = (device.type == "cuda") and (nw > 0)
     train_loader = DataLoader(
         train_ds, batch_size=H["batch_size"],
         shuffle=True, collate_fn=collate_fn,
-        num_workers=0, pin_memory=pin,
+        num_workers=nw, pin_memory=pin,
+        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
     val_loader = DataLoader(
         val_ds, batch_size=H["batch_size"],
         shuffle=False, collate_fn=collate_fn,
-        num_workers=0, pin_memory=pin,
+        num_workers=nw, pin_memory=pin,
+        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
     print(f"Train : {n_train}  |  Val : {n_val}")
 
