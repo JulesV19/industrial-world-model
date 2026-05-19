@@ -25,18 +25,20 @@ from .model import WorldModel
 
 # ── default hyperparameters ────────────────────────────────────────────────────
 DEFAULTS = dict(
-    shape_embed_dim = 128,
-    h_dim           = 256,
-    z_dim           = 32,
+    shape_embed_dim = 256,
+    h_dim           = 512,
+    z_dim           = 64,
     obs_dim         = 15,
     dropout         = 0.1,
+    free_bits       = 0.5,      # min KL par dim latente (évite le collapse)
+    gru_layers      = 3,
     lr              = 3e-4,
-    weight_decay    = 1e-5,
-    beta_kl         = 0.5,      # KL weight at full warm-up
-    kl_warmup       = 30,       # epochs to ramp KL from 0 to beta_kl
-    batch_size      = 16,
-    epochs          = 150,
-    grad_clip       = 10.0,
+    weight_decay    = 1e-4,
+    beta_kl         = 1.0,      # poids KL une fois le warm-up terminé
+    kl_warmup       = 50,       # rampe KL plus lente (évite le collapse précoce)
+    batch_size      = 64,       # A100 peut gérer
+    epochs          = 300,
+    grad_clip       = 5.0,      # plus serré pour stabiliser
     val_split       = 0.1,
     seed            = 42,
     save_dir        = "world_model/checkpoints",
@@ -130,6 +132,8 @@ def train(cfg: dict | None = None):
         z_dim           = H["z_dim"],
         obs_dim         = H["obs_dim"],
         dropout         = H["dropout"],
+        free_bits       = H["free_bits"],
+        gru_layers      = H["gru_layers"],
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())

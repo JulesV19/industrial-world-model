@@ -48,7 +48,9 @@ def load_model(ckpt_path: str, device: torch.device):
         h_dim           = H["h_dim"],
         z_dim           = H["z_dim"],
         obs_dim         = H["obs_dim"],
-        dropout         = 0.0,            # no dropout at inference
+        dropout         = 0.0,
+        free_bits       = H.get("free_bits", 0.5),
+        gru_layers      = H.get("gru_layers", 3),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

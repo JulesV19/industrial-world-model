@@ -64,8 +64,13 @@ def _load(save_dir: str, device: torch.device):
     ckpt = torch.load(os.path.join(save_dir, "best_model.pt"), map_location=device)
     H    = {**DEFAULTS, **ckpt.get("hyperparams", {})}
     model = WorldModel(
-        shape_embed_dim=H["shape_embed_dim"],
-        h_dim=H["h_dim"], z_dim=H["z_dim"], obs_dim=H["obs_dim"], dropout=0.0,
+        shape_embed_dim = H["shape_embed_dim"],
+        h_dim           = H["h_dim"],
+        z_dim           = H["z_dim"],
+        obs_dim         = H["obs_dim"],
+        dropout         = 0.0,
+        free_bits       = H.get("free_bits", 0.5),
+        gru_layers      = H.get("gru_layers", 3),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
