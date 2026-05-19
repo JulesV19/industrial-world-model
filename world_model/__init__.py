@@ -1,3 +1,2 @@
-from .model import WorldModel, ShapeEncoder, RSSM
+from .model import WorldModel, ShapeEncoder, TemporalDecoder
 from .dataset import TrajectoryDataset, Normalizer, collate_fn, METRIC_KEYS, OBS_DIM
-from .visualize import animate, show_in_colab
