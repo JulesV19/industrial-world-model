@@ -3,8 +3,12 @@ import random
 import math
 import json
 
-# Portée max du bras (L1+L2=2.0) moins marge de sécurité
-_MAX_REACH = 1.85
+# Portée max du bras (L1+L2 = 2√2 ≈ 2.83)
+_MAX_REACH = 2 * math.sqrt(2) - 0.05   # marge de sécurité
+
+# Carré de travail : les pièces doivent rester dans [0.1, 1.9]²
+_XMIN, _XMAX = 0.1, 1.9
+_YMIN, _YMAX = 0.1, 1.9
 
 
 # ── utilitaires géométriques ──────────────────────────────────────────────────
@@ -15,11 +19,20 @@ def _rotate(pts, angle):
 
 
 def _clamp_to_workspace(pts, bx, by):
-    """Réduit les coords locales si un coin dépasse _MAX_REACH depuis l'origine."""
-    worst = max(math.hypot(bx + x, by + y) for x, y in pts)
-    if worst > _MAX_REACH:
-        f = (_MAX_REACH - math.hypot(bx, by)) / (worst - math.hypot(bx, by))
-        f = max(0.05, min(f, 1.0))
+    """Réduit les coords locales si un sommet sort du carré [_XMIN,_XMAX]x[_YMIN,_YMAX]."""
+    worlds = [(bx + x, by + y) for x, y in pts]
+    # dépassement dans chaque direction
+    ox = max(0, max(wx - _XMAX for wx, _ in worlds),
+                  max(_XMIN - wx for wx, _ in worlds))
+    oy = max(0, max(wy - _YMAX for _, wy in worlds),
+                  max(_YMIN - wy for _, wy in worlds))
+    if ox > 0 or oy > 0:
+        # facteur de réduction conservatif
+        ext_x = max(abs(x) for x, y in pts) or 1e-9
+        ext_y = max(abs(y) for x, y in pts) or 1e-9
+        fx = max(0.05, (ext_x - ox) / ext_x) if ox > 0 else 1.0
+        fy = max(0.05, (ext_y - oy) / ext_y) if oy > 0 else 1.0
+        f  = min(fx, fy)
         pts = [(x * f, y * f) for x, y in pts]
     return pts
 
@@ -322,16 +335,16 @@ def generate_shape_database(num_shapes=100):
     db = []
 
     for _ in range(num_shapes):
-        # ── position du centre ───────────────────────────────────────────────
-        # Espace de travail élargi : x∈[0.25, 1.60], y∈[−0.70, 0.45]
-        for _ in range(20):   # ré-essai si trop loin de l'origine
-            base_x = random.uniform(0.25, 1.60)
-            base_y = random.uniform(-0.70, 0.45)
-            if math.hypot(base_x, base_y) < 1.60:
+        # ── position du centre ─────────────────────────────────────────────────
+        # Centre dans [0.5, 1.5]² pour laisser de la marge aux bords du carré
+        for _ in range(20):
+            base_x = random.uniform(0.5, 1.5)
+            base_y = random.uniform(0.5, 1.5)
+            if math.hypot(base_x, base_y) < _MAX_REACH:
                 break
 
-        # ── scale de base ────────────────────────────────────────────────────
-        scale = random.uniform(0.15, 0.90)
+        # ── scale de base (pièces larges ~50cm–1m, clampées dans [0.1,1.9]²) ──────
+        scale = random.uniform(0.50, 0.80)
 
         # ── choix et génération de la forme ──────────────────────────────────
         shape_type = random.choice(_SHAPE_NAMES)
@@ -346,26 +359,29 @@ def generate_shape_database(num_shapes=100):
 
         # Cisaillement
         if random.random() < 0.25:
-            shear = random.uniform(-0.30, 0.30)
+            shear = random.uniform(-0.15, 0.15)
             pts = [(x + shear * y, y) for x, y in pts]
 
         # Bruit sommet (imperfections de conception)
-        noise = random.uniform(0.0, 0.12) * scale
+        noise = random.uniform(0.0, 0.08) * scale
         pts = [(x + random.uniform(-noise, noise),
                 y + random.uniform(-noise, noise)) for x, y in pts]
 
         # ── rotation aléatoire ────────────────────────────────────────────────
         pts = _rotate(pts, random.uniform(0, 2*math.pi))
 
-        # ── contrainte workspace ──────────────────────────────────────────────
+        # ── contrainte workspace (carré [0.1, 1.9]²) ───────────────────────────
         pts = _clamp_to_workspace(pts, base_x, base_y)
 
-        # ── hauteur d'approche dynamique ──────────────────────────────────────
-        world_ys = [base_y + y for _, y in pts]
-        approach_y = max(max(world_ys) + 0.25, 0.70)
 
-        # ── construction du chemin ────────────────────────────────────────────
-        path = [(0.4, approach_y, False), (base_x, approach_y, False)]
+        # Home : position hors singularité — (0.1, 0.1) est le coin bas-gauche du workspace
+        # (0,0) exact est une singularité IK : l'IK n'y est pas continue, causant
+        # une discontinuité de q1 au premier mouvement.
+        _HOME = (0.1, 0.1)
+        path = [
+            (_HOME[0], _HOME[1], False),  # home (bras replié, non-singulier)
+            (base_x,   _YMIN,   False),   # approche colonne (bas du carré)
+        ]
 
         for i, (lx, ly) in enumerate(pts):
             path.append((base_x + lx, base_y + ly, i > 0))
@@ -374,8 +390,8 @@ def generate_shape_database(num_shapes=100):
         lx0, ly0 = pts[0]
         path.append((base_x + lx0, base_y + ly0, True))
 
-        path.append((base_x, approach_y, False))
-        path.append((0.4,    approach_y, False))
+        path.append((base_x,   _YMIN,   False))  # recul vers le bas
+        path.append((_HOME[0], _HOME[1], False))  # retour home
 
         db.append(path)
 

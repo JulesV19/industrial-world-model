@@ -2,7 +2,8 @@
 
 # --- PARAMÈTRES PHYSIQUES IDÉAUX ---
 m1, m2 = 2.0, 1.5
-l1, l2 = 1.0, 1.0
+import math as _math
+l1, l2 = _math.sqrt(2), _math.sqrt(2)   # portée totale = 2√2, atteint le coin (2,2)
 r1, r2 = 0.5, 0.5
 I1, I2 = 0.1, 0.08
 g = 9.81

@@ -21,6 +21,7 @@ import random
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.patches as mpatches
+import math
 import numpy as np
 import torch
 from torch.utils.data import random_split
@@ -34,7 +35,7 @@ from .train import DEFAULTS, get_device
 
 
 # ── cinématique directe ────────────────────────────────────────────────────────
-L1, L2 = 1.0, 1.0
+L1, L2 = math.sqrt(2), math.sqrt(2)   # portée totale 2√2, atteint le coin (2,2)
 
 def fk(q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     base  = np.zeros((len(q), 2))
@@ -85,6 +86,27 @@ def _get_split(save_dir, split, device):
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
     subset  = {"val": val_ds, "train": train_ds}.get(split, full_ds)
     return model, norm, H, full_ds, subset
+
+
+def _compute_loss_distribution(model, norm, H, full_ds, subset, device):
+    """Calcule la MSE loss (sur q) pour chaque épisode du subset.
+    Retourne un tableau numpy de shape (n_ep,)."""
+    losses = []
+    n_ep = len(subset)
+    print(f"Calcul de la distribution des losses sur {n_ep} épisodes...")
+    for ep_idx in range(n_ep):
+        try:
+            pred, tgt, _, seq_len, q_col, _ = _run_inference(
+                model, norm, H, full_ds, subset, ep_idx, device)
+            mse = float(np.mean((pred[:seq_len, q_col:q_col+2]
+                                 - tgt[:seq_len, q_col:q_col+2]) ** 2))
+        except Exception:
+            mse = float("nan")
+        losses.append(mse)
+        if (ep_idx + 1) % max(1, n_ep // 10) == 0:
+            print(f"  {ep_idx + 1}/{n_ep}")
+    print("Distribution calculée.")
+    return np.array(losses)
 
 
 def _run_inference(model, norm, H, full_ds, subset, ep_idx, device):
@@ -143,6 +165,9 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
     model, norm, H, full_ds, subset = _get_split(save_dir, split, device)
     n_ep   = len(subset)
 
+    # ── calcul distribution des losses ───────────────────────────────────────
+    all_losses = _compute_loss_distribution(model, norm, H, full_ds, subset, device)
+
     _UNITS = {"q_real":"rad","q_des":"rad","q_sensed":"rad",
               "dq_real":"rad/s","dq_des":"rad/s","dq_sensed":"rad/s",
               "tau":"N·m","is_cutting":"prob"}
@@ -154,18 +179,44 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
              elbow_t=None, elbow_p=None, tip_t=None, tip_p=None)
 
     # ── figure & axes ─────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(16, 10))
-    gs  = fig.add_gridspec(4, 2, left=0.05, right=0.97,
-                           top=0.92, bottom=0.23, hspace=0.55, wspace=0.30)
+    fig = plt.figure(figsize=(18, 10))
+    gs  = fig.add_gridspec(4, 3, left=0.05, right=0.97,
+                           top=0.92, bottom=0.23, hspace=0.55, wspace=0.35)
     ax_arm      = fig.add_subplot(gs[:, 0])
     metric_axes = [fig.add_subplot(gs[i, 1]) for i in range(4)]
+    ax_dist     = fig.add_subplot(gs[:2, 2])   # histogramme distribution (moitié haute)
+    ax_rank     = fig.add_subplot(gs[2:, 2])   # rang / percentile (moitié basse)
+
+    # ── histogramme de distribution des losses ────────────────────────────────
+    valid_losses = all_losses[~np.isnan(all_losses)]
+    ax_dist.hist(valid_losses, bins=40, color="steelblue", alpha=0.75, edgecolor="white", lw=0.4)
+    ax_dist.set_title("Distribution des losses (MSE q)", fontsize=9)
+    ax_dist.set_xlabel("MSE", fontsize=8)
+    ax_dist.set_ylabel("# épisodes", fontsize=8)
+    ax_dist.grid(True, alpha=0.25)
+    loss_marker_v  = ax_dist.axvline(np.nan, color="tomato", lw=2, ls="--", label="pièce courante")
+    loss_marker_tx = ax_dist.text(0.98, 0.95, "", transform=ax_dist.transAxes,
+                                  fontsize=8, ha="right", va="top",
+                                  color="tomato", fontweight="bold")
+    ax_dist.legend(fontsize=7, loc="upper left")
+
+    # ── graphe rang trié (toutes les losses) ──────────────────────────────────
+    sorted_idx  = np.argsort(valid_losses)
+    ax_rank.plot(np.arange(len(valid_losses)), valid_losses[sorted_idx],
+                 color="steelblue", lw=1.2)
+    ax_rank.set_title("Losses triées", fontsize=9)
+    ax_rank.set_xlabel("Rang", fontsize=8)
+    ax_rank.set_ylabel("MSE", fontsize=8)
+    ax_rank.grid(True, alpha=0.25)
+    rank_marker_h = ax_rank.axhline(np.nan, color="tomato", lw=1.5, ls="--")
+    rank_marker_pt, = ax_rank.plot([], [], "o", color="tomato", ms=7, zorder=5)
 
     # Axes widgets
-    ax_sl_ep  = fig.add_axes([0.07, 0.13, 0.60, 0.03])
-    ax_sl_t   = fig.add_axes([0.07, 0.07, 0.60, 0.03])
-    ax_btn_pp = fig.add_axes([0.70, 0.06, 0.07, 0.07])
-    ax_btn_prv= fig.add_axes([0.79, 0.06, 0.07, 0.07])
-    ax_btn_nxt= fig.add_axes([0.88, 0.06, 0.07, 0.07])
+    ax_sl_ep  = fig.add_axes([0.05, 0.13, 0.60, 0.03])
+    ax_sl_t   = fig.add_axes([0.05, 0.07, 0.60, 0.03])
+    ax_btn_pp = fig.add_axes([0.68, 0.06, 0.07, 0.07])
+    ax_btn_prv= fig.add_axes([0.77, 0.06, 0.07, 0.07])
+    ax_btn_nxt= fig.add_axes([0.86, 0.06, 0.07, 0.07])
 
     sl_ep   = mwidgets.Slider(ax_sl_ep,  "Pièce", 0, max(1, n_ep - 1),
                               valinit=0, valstep=1)
@@ -178,9 +229,9 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
     title_text = fig.suptitle("", fontsize=11)
 
     # ── bras : artists statiques & animés ─────────────────────────────────────
-    arm_lim = L1 + L2 + 0.15
-    ax_arm.set_xlim(-arm_lim, arm_lim)
-    ax_arm.set_ylim(-arm_lim, arm_lim)
+    arm_lim = L1 + L2 + 0.2
+    ax_arm.set_xlim(-0.3, arm_lim)
+    ax_arm.set_ylim(-0.3, arm_lim)
     ax_arm.set_aspect("equal")
     ax_arm.set_xlabel("x [m]"); ax_arm.set_ylabel("y [m]")
     ax_arm.axhline(0, color="gray", lw=0.5)
@@ -308,6 +359,18 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
             f"World model — [{split}]  pièce {ep} / {n_ep - 1}  "
             f"({S['seq_len']} pas,  shape → trajectoire complète)")
 
+        # ── mise à jour distribution ──────────────────────────────────────────
+        ep_loss = all_losses[ep]
+        loss_marker_v.set_xdata([ep_loss, ep_loss])
+        valid_mask = ~np.isnan(all_losses)
+        percentile = float(np.mean(all_losses[valid_mask] <= ep_loss) * 100)
+        rank_in_sorted = int(np.sum(valid_losses <= ep_loss))
+        loss_marker_tx.set_text(
+            f"MSE={ep_loss:.4f}\nPercentile {percentile:.0f}%")
+        rank_marker_h.set_ydata([ep_loss, ep_loss])
+        rank_marker_pt.set_data([rank_in_sorted], [ep_loss])
+        ax_dist.figure.canvas.draw_idle()
+
         _refresh_static()
         _rebuild_metrics()
         _draw_frame(0)
@@ -389,8 +452,8 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
 
     t_axis = np.arange(seq_len) * 0.01
 
-    arm_lim = L1 + L2 + 0.15
-    ax_arm.set_xlim(-arm_lim, arm_lim); ax_arm.set_ylim(-arm_lim, arm_lim)
+    arm_lim = L1 + L2 + 0.2
+    ax_arm.set_xlim(-0.3, arm_lim); ax_arm.set_ylim(-0.3, arm_lim)
     ax_arm.set_aspect("equal")
     ax_arm.set_title("Bras 2-DOF")
     ax_arm.set_xlabel("x [m]"); ax_arm.set_ylabel("y [m]")
