@@ -233,16 +233,19 @@ def train(cfg: dict | None = None):
         history["lr"       ].append(current_lr)
         history["grad_norm"].append(avg_grad_norm)
 
-        improved = avg_val < best_val
+        # Critère de suivi = reconstruction seule (MSE + BCE), sans le terme KL*β
+        # qui augmente artificiellement pendant le warm-up et fausserait l'early stopping.
+        val_recon = avg_mse + avg_bce
+        improved = val_recon < best_val
         if improved:
-            best_val      = avg_val
+            best_val      = val_recon
             epochs_no_imp = 0
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "hyperparams": H,
-                    "val_loss": best_val,
+                    "val_loss": val_recon,
                 },
                 os.path.join(H["save_dir"], "best_model.pt"),
             )
@@ -251,7 +254,7 @@ def train(cfg: dict | None = None):
 
         # Update outer bar suffix with key metrics
         epoch_bar.set_postfix(
-            val=f"{avg_val:.4f}",
+            recon=f"{val_recon:.4f}",
             best=f"{best_val:.4f}",
             mse=f"{avg_mse:.4f}",
             bce=f"{avg_bce:.4f}",
