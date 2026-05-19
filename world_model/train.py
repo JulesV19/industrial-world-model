@@ -40,6 +40,8 @@ DEFAULTS = dict(
     val_split       = 0.1,
     seed            = 42,
     num_workers     = 0,        # 0 = optimal : dataset entièrement pré-chargé en RAM
+    subsample_factor= 1,        # sous-échantillonnage temporel (ex: 10 = 1 step sur 10)
+    use_amp         = True,     # mixed precision BF16 (A100/T4 uniquement)
     target_keys     = "q_real",  # signaux à prédire (séparés par virgule)
     save_dir        = "world_model/checkpoints",
     data_dir        = "dataset",
@@ -141,6 +143,17 @@ def train(cfg: dict | None = None):
     epochs_no_imp = 0
     t_start       = time.time()
 
+    # Mixed precision
+    use_amp = H["use_amp"] and device.type == "cuda"
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    amp_dtype = torch.bfloat16   # BF16 : pas de perte de dynamique sur A100/T4
+    print(f"Mixed precision BF16 : {'ON' if use_amp else 'OFF'}")
+
+    # Sous-échantillonnage temporel
+    sf = max(1, int(H["subsample_factor"]))
+    if sf > 1:
+        print(f"Sous-échantillonnage : 1 step sur {sf} (T divisé par {sf})")
+
     # ── epoch loop ────────────────────────────────────────────────────────────
     epoch_bar = tqdm(range(1, H["epochs"] + 1), desc="Training", unit="epoch")
 
@@ -152,28 +165,29 @@ def train(cfg: dict | None = None):
         train_total     = 0.0
         total_grad_norm = 0.0
 
-        batch_bar = tqdm(
-            train_loader,
-            desc=f"  Epoch {epoch:3d} train",
-            leave=False,
-            unit="batch",
-        )
-        for wps, wp_len, speed, obs, seq_len in batch_bar:
+        for wps, wp_len, speed, obs, seq_len in train_loader:
             wps, wp_len  = wps.to(device), wp_len.to(device)
             speed        = speed.to(device)
             obs, seq_len = obs.to(device), seq_len.to(device)
 
+            # Sous-échantillonnage temporel : réduit T avant le GRU
+            if sf > 1:
+                obs     = obs[:, ::sf, :].contiguous()
+                seq_len = (seq_len + sf - 1) // sf
+
             optimizer.zero_grad()
-            preds, _ = model(wps, wp_len, speed, targets=obs)
-            loss     = compute_loss(preds, obs, seq_len)
-            loss.backward()
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                preds, _ = model(wps, wp_len, speed, targets=obs)
+                loss     = compute_loss(preds, obs, seq_len)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_total     += loss.item()
             total_grad_norm += grad_norm.item()
 
-            batch_bar.set_postfix(mse=f"{loss.item():.4f}")
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -186,8 +200,12 @@ def train(cfg: dict | None = None):
                 wps, wp_len  = wps.to(device), wp_len.to(device)
                 speed        = speed.to(device)
                 obs, seq_len = obs.to(device), seq_len.to(device)
-                preds, _     = model(wps, wp_len, speed, targets=obs)
-                val_total   += compute_loss(preds, obs, seq_len).item()
+                if sf > 1:
+                    obs     = obs[:, ::sf, :].contiguous()
+                    seq_len = (seq_len + sf - 1) // sf
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                    preds, _ = model(wps, wp_len, speed, targets=obs)
+                    val_total += compute_loss(preds, obs, seq_len).item()
 
         avg_train     = train_total     / len(train_loader)
         avg_val       = val_total       / len(val_loader)
