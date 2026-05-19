@@ -3,89 +3,387 @@ import random
 import math
 import json
 
-def load_shape_database(filename="pieces_database.json"):
-    with open(filename, "r") as f:
-        return json.load(f)
+# Portée max du bras (L1+L2=2.0) moins marge de sécurité
+_MAX_REACH = 1.85
+
+
+# ── utilitaires géométriques ──────────────────────────────────────────────────
+
+def _rotate(pts, angle):
+    c, s = math.cos(angle), math.sin(angle)
+    return [(x*c - y*s, x*s + y*c) for x, y in pts]
+
+
+def _clamp_to_workspace(pts, bx, by):
+    """Réduit les coords locales si un coin dépasse _MAX_REACH depuis l'origine."""
+    worst = max(math.hypot(bx + x, by + y) for x, y in pts)
+    if worst > _MAX_REACH:
+        f = (_MAX_REACH - math.hypot(bx, by)) / (worst - math.hypot(bx, by))
+        f = max(0.05, min(f, 1.0))
+        pts = [(x * f, y * f) for x, y in pts]
+    return pts
+
+
+def _center(pts):
+    """Centre les points locaux autour de (0,0)."""
+    mx = sum(x for x, y in pts) / len(pts)
+    my = sum(y for x, y in pts) / len(pts)
+    return [(x - mx, y - my) for x, y in pts]
+
+
+# ── générateurs de formes (coords locales, centrées en 0) ────────────────────
+
+def _rectangle(s):
+    w = s
+    h = s * random.uniform(0.25, 2.8)
+    hw, hh = w/2, h/2
+    return [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+
+
+def _triangle(s):
+    style = random.choice(["iso", "right", "scalene", "obtuse"])
+    if style == "iso":
+        apex_x = random.uniform(-s*0.25, s*0.25)
+        return [(-s/2, -s/2), (s/2, -s/2), (apex_x, s/2)]
+    elif style == "right":
+        ax = s * random.uniform(0.4, 1.0)
+        ay = s * random.uniform(0.4, 1.0)
+        return [(0, 0), (ax, 0), (0, ay)]
+    elif style == "scalene":
+        pts = [(random.uniform(-s/2, s/2), random.uniform(-s/2, s/2)) for _ in range(3)]
+        return _center(pts)
+    else:  # obtuse
+        return [(-s*0.65, -s/4), (s*0.65, -s/4),
+                (s*random.uniform(-0.6, 0.0), s/4)]
+
+
+def _trapezoid(s):
+    w_bot = s * random.uniform(0.6, 1.3)
+    w_top = s * random.uniform(0.15, 0.85)
+    h = s * random.uniform(0.35, 1.1)
+    offset = s * random.uniform(-0.35, 0.35)
+    return [(-w_bot/2, -h/2), (w_bot/2, -h/2),
+            (offset + w_top/2, h/2), (offset - w_top/2, h/2)]
+
+
+def _parallelogram(s):
+    w = s * random.uniform(0.7, 1.4)
+    h = s * random.uniform(0.3, 1.0)
+    shear = s * random.uniform(0.15, 0.5)
+    return [(-w/2, -h/2), (w/2 - shear, -h/2),
+            (w/2, h/2),   (-w/2 + shear, h/2)]
+
+
+def _regular_polygon(s):
+    n = random.randint(5, 10)
+    r = s / 2
+    off = random.uniform(0, math.pi / n)
+    return [(r * math.cos(i * 2*math.pi/n + off),
+             r * math.sin(i * 2*math.pi/n + off)) for i in range(n)]
+
+
+def _ellipse(s):
+    rx = s / 2
+    ry = rx * random.uniform(0.25, 2.2)
+    n = random.randint(12, 26)
+    return [(rx * math.cos(i * 2*math.pi/n),
+             ry * math.sin(i * 2*math.pi/n)) for i in range(n)]
+
+
+def _sector(s):
+    """Secteur angulaire (camembert)."""
+    r = s / 2
+    span = random.uniform(math.pi/5, 5*math.pi/3)
+    start = random.uniform(0, 2*math.pi)
+    n = random.randint(8, 18)
+    pts = [(0.0, 0.0)]
+    for i in range(n + 1):
+        a = start + i * span / n
+        pts.append((r * math.cos(a), r * math.sin(a)))
+    return _center(pts)
+
+
+def _l_shape(s):
+    th = s * random.uniform(0.15, 0.42)
+    fx, fy = random.choice([1, -1]), random.choice([1, -1])
+    pts = [(-s/2, -s/2), (s/2, -s/2), (s/2, -s/2 + th),
+           (-s/2 + th, -s/2 + th), (-s/2 + th, s/2), (-s/2, s/2)]
+    return [(x*fx, y*fy) for x, y in pts]
+
+
+def _t_shape(s):
+    bar_h  = s * random.uniform(0.18, 0.38)
+    stem_w = s * random.uniform(0.18, 0.42)
+    stem_h = s * random.uniform(0.35, 0.70)
+    bar_w  = s
+    off    = s * random.uniform(-0.18, 0.18)   # tige décalée
+    top = s/2; bb = s/2 - bar_h; sb = bb - stem_h
+    pts = [
+        (-bar_w/2, top), (bar_w/2, top),
+        (bar_w/2, bb),
+        (off + stem_w/2, bb), (off + stem_w/2, sb),
+        (off - stem_w/2, sb), (off - stem_w/2, bb),
+        (-bar_w/2, bb),
+    ]
+    return _center(pts)
+
+
+def _u_shape(s):
+    wall = s * random.uniform(0.12, 0.30)
+    depth = s * random.uniform(0.40, 0.72)
+    inner_w = s * random.uniform(0.22, 0.55)
+    outer_w = inner_w + 2 * wall
+    pts = [
+        (-outer_w/2, -s/2), (outer_w/2, -s/2),
+        (outer_w/2, -s/2 + depth),
+        (outer_w/2 - wall, -s/2 + depth),
+        (outer_w/2 - wall, -s/2 + wall),
+        (-(outer_w/2 - wall), -s/2 + wall),
+        (-(outer_w/2 - wall), -s/2 + depth),
+        (-outer_w/2, -s/2 + depth),
+    ]
+    return _center(pts)
+
+
+def _c_shape(s):
+    pts = _u_shape(s)
+    return [(-y, x) for x, y in pts]   # rotation 90°
+
+
+def _cross(s):
+    arm_w = s * random.uniform(0.18, 0.48)
+    h, hw = s/2, arm_w/2
+    return [
+        (-hw, -h), (hw, -h),
+        (hw, -hw), (h, -hw),
+        (h,  hw),  (hw, hw),
+        (hw,  h),  (-hw,  h),
+        (-hw, hw), (-h,  hw),
+        (-h, -hw), (-hw, -hw),
+    ]
+
+
+def _arrow(s):
+    head_w = s * random.uniform(0.5, 0.95)
+    head_h = s * random.uniform(0.28, 0.55)
+    shaft_w = s * random.uniform(0.14, 0.38)
+    return [
+        (0, s/2),
+        (head_w/2, s/2 - head_h),
+        (shaft_w/2, s/2 - head_h),
+        (shaft_w/2, -s/2),
+        (-shaft_w/2, -s/2),
+        (-shaft_w/2, s/2 - head_h),
+        (-head_w/2, s/2 - head_h),
+    ]
+
+
+def _star_regular(s):
+    n = random.randint(4, 8)
+    R = s / 2
+    r = R * random.uniform(0.22, 0.68)
+    pts = []
+    for i in range(n * 2):
+        radius = R if i % 2 == 0 else r
+        a = i * math.pi / n
+        pts.append((radius * math.cos(a), radius * math.sin(a)))
+    return pts
+
+
+def _star_irregular(s):
+    """Étoile avec rayons extérieurs variables par pointe."""
+    n = random.randint(4, 9)
+    R = s / 2
+    r_inner = R * random.uniform(0.18, 0.50)
+    pts = []
+    for i in range(n):
+        R_i = R * random.uniform(0.55, 1.0)
+        a_out = i * 2*math.pi / n + random.uniform(-0.12, 0.12)
+        a_in  = a_out + math.pi / n
+        pts.append((R_i * math.cos(a_out), R_i * math.sin(a_out)))
+        ri = r_inner * random.uniform(0.65, 1.35)
+        pts.append((ri * math.cos(a_in), ri * math.sin(a_in)))
+    return pts
+
+
+def _e_shape(s):
+    spine_w = s * random.uniform(0.12, 0.24)
+    bar_h   = s * random.uniform(0.10, 0.20)
+    width   = s * random.uniform(0.55, 0.95)
+    mid_w   = width * random.uniform(0.45, 0.90)
+    gap     = (s - 3*bar_h) / 2
+    x0 = -s/2
+    pts = [
+        (x0, -s/2),
+        (x0 + width, -s/2),
+        (x0 + width, -s/2 + bar_h),
+        (x0 + spine_w, -s/2 + bar_h),
+        (x0 + spine_w, -s/2 + bar_h + gap),
+        (x0 + mid_w, -s/2 + bar_h + gap),
+        (x0 + mid_w, -s/2 + 2*bar_h + gap),
+        (x0 + spine_w, -s/2 + 2*bar_h + gap),
+        (x0 + spine_w, -s/2 + 2*bar_h + 2*gap),
+        (x0 + width, -s/2 + 2*bar_h + 2*gap),
+        (x0 + width, s/2),
+        (x0, s/2),
+    ]
+    return _center(pts)
+
+
+def _comb(s):
+    n_teeth = random.randint(2, 5)
+    tooth_h = s * random.uniform(0.28, 0.60)
+    tooth_w_frac = random.uniform(0.35, 0.65)   # fraction de l'espace par dent
+    total_slots = 2 * n_teeth + 1
+    slot_w = s / total_slots
+    tooth_w = slot_w * tooth_w_frac
+    gap_w   = slot_w * (2 - tooth_w_frac)       # gap entre dents
+    base_h  = s - tooth_h
+
+    pts = [(-s/2, -s/2), (-s/2, -s/2 + base_h)]
+    for i in range(n_teeth):
+        tx = -s/2 + gap_w * (i + 0.5) + (tooth_w + gap_w) * i
+        pts.extend([
+            (tx, -s/2 + base_h),
+            (tx, s/2),
+            (tx + tooth_w, s/2),
+            (tx + tooth_w, -s/2 + base_h),
+        ])
+    pts.extend([(s/2, -s/2 + base_h), (s/2, -s/2)])
+    return _center(pts)
+
+
+def _zigzag(s):
+    n = random.randint(3, 7)
+    amp   = s * random.uniform(0.18, 0.45)
+    thick = s * random.uniform(0.08, 0.22)
+    step  = s / n
+    pts   = []
+    for i in range(n + 1):
+        y = -s/2 + i * step
+        x = amp/2 if i % 2 == 0 else -amp/2
+        pts.append((x, y))
+    for i in range(n, -1, -1):
+        y = -s/2 + i * step
+        x = amp/2 if i % 2 == 0 else -amp/2
+        pts.append((x - thick, y))
+    return _center(pts)
+
+
+def _random_polygon(s):
+    n = random.randint(5, 14)
+    angles = sorted(random.uniform(0, 2*math.pi) for _ in range(n))
+    return [(s/2 * random.uniform(0.25, 1.0) * math.cos(a),
+             s/2 * random.uniform(0.25, 1.0) * math.sin(a)) for a in angles]
+
+
+def _blob(s):
+    """Polygone lisse aux contours organiques."""
+    n = random.randint(9, 18)
+    angles = [i * 2*math.pi / n for i in range(n)]
+    radii  = [s/2 * random.uniform(0.35, 1.0) for _ in range(n)]
+    for _ in range(4):   # lissage
+        radii = [(radii[i-1] + 2*radii[i] + radii[(i+1) % n]) / 4 for i in range(n)]
+    return [(radii[i] * math.cos(angles[i]),
+             radii[i] * math.sin(angles[i])) for i in range(n)]
+
+
+# ── table des formes ──────────────────────────────────────────────────────────
+
+_SHAPES = [
+    ("RECTANGLE",       _rectangle),
+    ("TRIANGLE",        _triangle),
+    ("TRAPEZOID",       _trapezoid),
+    ("PARALLELOGRAM",   _parallelogram),
+    ("REGULAR_POLYGON", _regular_polygon),
+    ("ELLIPSE",         _ellipse),
+    ("SECTOR",          _sector),
+    ("L_SHAPE",         _l_shape),
+    ("T_SHAPE",         _t_shape),
+    ("U_SHAPE",         _u_shape),
+    ("C_SHAPE",         _c_shape),
+    ("CROSS",           _cross),
+    ("ARROW",           _arrow),
+    ("STAR",            _star_regular),
+    ("IRREGULAR_STAR",  _star_irregular),
+    ("E_SHAPE",         _e_shape),
+    ("COMB",            _comb),
+    ("ZIGZAG",          _zigzag),
+    ("RANDOM_POLYGON",  _random_polygon),
+    ("BLOB",            _blob),
+]
+_SHAPE_NAMES = [n for n, _ in _SHAPES]
+_SHAPE_FNS   = {n: fn for n, fn in _SHAPES}
+
+
+# ── générateur principal ──────────────────────────────────────────────────────
 
 def generate_shape_database(num_shapes=100):
     db = []
-    safe_z = 0.6 # Position de repli (hauteur)
 
     for _ in range(num_shapes):
-        # Position aléatoire du centre de la pièce dans l'espace de travail
-        base_x = random.uniform(0.85, 1.15)
-        base_y = random.uniform(-0.3, 0.2)
-        
-        # Rotation aléatoire de la pièce
-        rotation = random.uniform(0, 2 * math.pi)
+        # ── position du centre ───────────────────────────────────────────────
+        # Espace de travail élargi : x∈[0.25, 1.60], y∈[−0.70, 0.45]
+        for _ in range(20):   # ré-essai si trop loin de l'origine
+            base_x = random.uniform(0.25, 1.60)
+            base_y = random.uniform(-0.70, 0.45)
+            if math.hypot(base_x, base_y) < 1.60:
+                break
 
-        shape_type = random.choice(["L_SHAPE", "RECTANGLE", "TRIANGLE", "HEXAGON", "STAR", "CIRCLE", "RANDOM_POLYGON"])
-        scale = random.uniform(0.3, 0.7) 
-        
-        path = [(0.4, safe_z, False), (base_x, safe_z, False)] # Approche
-        
-        def add_points(pts_local):
-            for i, (lx, ly) in enumerate(pts_local):
-                # Application de la rotation et translation
-                rx = lx * math.cos(rotation) - ly * math.sin(rotation)
-                ry = lx * math.sin(rotation) + ly * math.cos(rotation)
-                path.append((base_x + rx, base_y + ry, i > 0)) # i=0 -> Descente sans couper
-            
-            # Fermeture de la forme (retour au point initial avec coupe)
-            lx, ly = pts_local[0]
-            rx = lx * math.cos(rotation) - ly * math.sin(rotation)
-            ry = lx * math.sin(rotation) + ly * math.cos(rotation)
-            path.append((base_x + rx, base_y + ry, True))
+        # ── scale de base ────────────────────────────────────────────────────
+        scale = random.uniform(0.15, 0.90)
 
-        pts = []
-        if shape_type == "RECTANGLE":
-            w, h = scale, scale * random.uniform(0.4, 1.8)
-            pts = [(-w/2, -h/2), (w/2, -h/2), (w/2, h/2), (-w/2, h/2)]
-            
-        elif shape_type == "L_SHAPE":
-            th = scale * random.uniform(0.2, 0.4)
-            pts = [(-scale/2, -scale/2), (scale/2, -scale/2), (scale/2, -scale/2 + th),
-                   (-scale/2 + th, -scale/2 + th), (-scale/2 + th, scale/2), (-scale/2, scale/2)]
-            
-        elif shape_type == "TRIANGLE":
-            pts = [(-scale/2, -scale/2), (scale/2, -scale/2), (random.uniform(-scale/4, scale/4), scale/2)]
-            
-        elif shape_type == "HEXAGON":
-            for i in range(6):
-                angle = i * (math.pi / 3)
-                pts.append((scale/2 * math.cos(angle), scale/2 * math.sin(angle)))
+        # ── choix et génération de la forme ──────────────────────────────────
+        shape_type = random.choice(_SHAPE_NAMES)
+        pts = _SHAPE_FNS[shape_type](scale)
 
-        elif shape_type == "STAR":
-            points = random.choice([4, 5, 6, 7])
-            outer_r = scale / 2
-            inner_r = outer_r * random.uniform(0.3, 0.6)
-            for i in range(points * 2):
-                r = outer_r if i % 2 == 0 else inner_r
-                angle = i * (math.pi / points)
-                pts.append((r * math.cos(angle), r * math.sin(angle)))
+        # ── déformations additionnelles ───────────────────────────────────────
+        # Echelle non-uniforme (anisotropie)
+        if random.random() < 0.45:
+            sx = random.uniform(0.55, 1.60)
+            sy = random.uniform(0.55, 1.60)
+            pts = [(x * sx, y * sy) for x, y in pts]
 
-        elif shape_type == "CIRCLE":
-            resolution = random.randint(12, 24)
-            r = scale / 2
-            for i in range(resolution):
-                angle = i * (2 * math.pi / resolution)
-                pts.append((r * math.cos(angle), r * math.sin(angle)))
+        # Cisaillement
+        if random.random() < 0.25:
+            shear = random.uniform(-0.30, 0.30)
+            pts = [(x + shear * y, y) for x, y in pts]
 
-        elif shape_type == "RANDOM_POLYGON":
-            points = random.randint(4, 7)
-            angles = sorted([random.uniform(0, 2 * math.pi) for _ in range(points)])
-            for angle in angles:
-                r = (scale/2) * random.uniform(0.5, 1.0)
-                pts.append((r * math.cos(angle), r * math.sin(angle)))
+        # Bruit sommet (imperfections de conception)
+        noise = random.uniform(0.0, 0.12) * scale
+        pts = [(x + random.uniform(-noise, noise),
+                y + random.uniform(-noise, noise)) for x, y in pts]
 
-        # Ajout d'un bruit sur les sommets pour déformer légèrement (imperfections de conception)
-        noise_level = random.uniform(0.0, 0.05) if shape_type != "CIRCLE" else 0.0
-        noisy_pts = [(x + random.uniform(-noise_level, noise_level), y + random.uniform(-noise_level, noise_level)) for x, y in pts]
+        # ── rotation aléatoire ────────────────────────────────────────────────
+        pts = _rotate(pts, random.uniform(0, 2*math.pi))
 
-        add_points(noisy_pts)
-                
-        path.append((base_x, safe_z, False)) # Dégagement vertical
-        path.append((0.4, safe_z, False))    # Retour point de repos
+        # ── contrainte workspace ──────────────────────────────────────────────
+        pts = _clamp_to_workspace(pts, base_x, base_y)
+
+        # ── hauteur d'approche dynamique ──────────────────────────────────────
+        world_ys = [base_y + y for _, y in pts]
+        approach_y = max(max(world_ys) + 0.25, 0.70)
+
+        # ── construction du chemin ────────────────────────────────────────────
+        path = [(0.4, approach_y, False), (base_x, approach_y, False)]
+
+        for i, (lx, ly) in enumerate(pts):
+            path.append((base_x + lx, base_y + ly, i > 0))
+
+        # Fermeture de la forme
+        lx0, ly0 = pts[0]
+        path.append((base_x + lx0, base_y + ly0, True))
+
+        path.append((base_x, approach_y, False))
+        path.append((0.4,    approach_y, False))
+
         db.append(path)
-        
+
     return db
+
+
+# ── chargement ────────────────────────────────────────────────────────────────
+
+def load_shape_database(filename="pieces_database.json"):
+    with open(filename, "r") as f:
+        return json.load(f)
