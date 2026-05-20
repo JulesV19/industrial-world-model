@@ -77,6 +77,23 @@ class ResBlock(nn.Module):
         return x + self.net(x)
 
 
+# ── Quality head ──────────────────────────────────────────────────────────────
+class QualityHead(nn.Module):
+    """Prédit (cut_deviation normalisé, logit cut_defect) depuis les hidden states du GRU."""
+
+    def __init__(self, h_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(h_dim, h_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(h_dim // 2, 2),   # [:, 0] = déviation  |  [:, 1] = logit défaut
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h)   # (..., 2)
+
+
 # ── Temporal decoder ───────────────────────────────────────────────────────────
 class TemporalDecoder(nn.Module):
     """
@@ -118,13 +135,14 @@ class TemporalDecoder(nn.Module):
         )
 
         # Décodeur résiduel
-        self.dec_in  = nn.Linear(h_dim, h_dim)
-        self.dec_res = nn.Sequential(
+        self.dec_in      = nn.Linear(h_dim, h_dim)
+        self.dec_res     = nn.Sequential(
             ResBlock(h_dim, dropout),
             ResBlock(h_dim, dropout),
             ResBlock(h_dim, dropout),
         )
-        self.dec_out = nn.Linear(h_dim, obs_dim)
+        self.dec_out     = nn.Linear(h_dim, obs_dim)
+        self.quality_head = QualityHead(h_dim, dropout)
 
     def forward(
         self,
@@ -133,14 +151,16 @@ class TemporalDecoder(nn.Module):
         targets:     torch.Tensor | None = None,
         p_teacher:   float               = 1.0,
         q_init:      torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         shape_embed : (B, E)
         T           : longueur de séquence à générer
         targets     : (B, T, obs_dim) — ground truth pour teacher forcing
         p_teacher   : probabilité par séquence d'utiliser le teacher forcing (1.0 = pur TF)
         q_init      : (B, obs_dim) ou (obs_dim,) — état initial normalisé
-        returns     : (B, T, obs_dim)
+        returns     : (traj: B×T×obs_dim, quality: B×T×2)
+                      quality[:,:,0] = cut_deviation normalisé (régression)
+                      quality[:,:,1] = logit cut_defect (classification)
         """
         B, E   = shape_embed.shape
         device = shape_embed.device
@@ -153,7 +173,6 @@ class TemporalDecoder(nn.Module):
         pe  = self.pe(T).unsqueeze(0).expand(B, T, -1)  # (B, T, pe_dim)
         ctx = shape_embed.unsqueeze(1).expand(B, T, E)  # (B, T, E)
 
-        # État initial : IK(HOME) normalisé (fourni par train.py), sinon zéros
         if q_init is None:
             q_prev = torch.zeros(B, self.obs_dim, device=device, dtype=dtype)
         else:
@@ -163,53 +182,54 @@ class TemporalDecoder(nn.Module):
 
         # ── Chemin rapide : teacher forcing pur → un seul appel GRU batché ──
         if p_teacher >= 1.0 and targets is not None:
-            # Décaler les targets d'un pas : [q_init, t0, t1, …, t_{T-2}]
             q_shifted = torch.cat([q_prev.unsqueeze(1), targets[:, :-1, :]], dim=1)
             x = torch.cat([ctx, pe, q_shifted], dim=-1).contiguous()
-            h_seq, _ = self.gru(x, h0)
-            out = self.dec_in(h_seq)
-            out = self.dec_res(out)
-            return self.dec_out(out)                     # (B, T, obs_dim)
+            h_raw, _ = self.gru(x, h0)
+            traj    = self.dec_out(self.dec_res(self.dec_in(h_raw)))
+            quality = self.quality_head(h_raw)
+            return traj, quality
 
         # ── Scheduled sampling par séquence ──
-        # Chaque séquence tire son label une seule fois : teacher ou free-running.
-        # Les séquences teacher sont traitées en un seul appel GRU batché (chemin
-        # rapide) ; les séquences free-running font la boucle step-by-step sur un
-        # sous-batch réduit.
-        is_teacher = torch.rand(B, device=device) < p_teacher   # (B,) bool
-        t_idx = is_teacher.nonzero(as_tuple=True)[0]            # indices teacher
-        f_idx = (~is_teacher).nonzero(as_tuple=True)[0]         # indices free-running
+        # Si targets est None (inférence), tout le batch va en free-running.
+        eff_p = p_teacher if targets is not None else 0.0
+        is_teacher = torch.rand(B, device=device) < eff_p
+        t_idx = is_teacher.nonzero(as_tuple=True)[0]
+        f_idx = (~is_teacher).nonzero(as_tuple=True)[0]
 
-        out = torch.empty(B, T, self.obs_dim, device=device, dtype=dtype)
+        traj     = torch.empty(B, T, self.obs_dim, device=device, dtype=dtype)
+        h_states = torch.empty(B, T, self.h_dim,   device=device, dtype=dtype)
 
         # — sous-batch teacher : un seul appel GRU —
         if t_idx.numel() > 0:
             q_shifted = torch.cat([q_prev[t_idx].unsqueeze(1),
                                    targets[t_idx, :-1, :]], dim=1)
             x = torch.cat([ctx[t_idx], pe[t_idx], q_shifted], dim=-1).contiguous()
-            h_seq, _ = self.gru(x, h0[:, t_idx, :].contiguous())
-            h_seq = self.dec_in(h_seq)
-            h_seq = self.dec_res(h_seq)
-            out[t_idx] = self.dec_out(h_seq).to(dtype)
+            h_raw, _ = self.gru(x, h0[:, t_idx, :].contiguous())
+            h_states[t_idx] = h_raw
+            traj[t_idx]     = self.dec_out(self.dec_res(self.dec_in(h_raw)))
 
         # — sous-batch free-running : boucle step-by-step —
         if f_idx.numel() > 0:
-            Bf   = f_idx.numel()
-            h_f  = h0[:, f_idx, :].contiguous()
-            qp_f = q_prev[f_idx]
+            h_f   = h0[:, f_idx, :].contiguous()
+            qp_f  = q_prev[f_idx]
             ctx_f = ctx[f_idx]
             pe_f  = pe[f_idx]
-            buf  = []
+            traj_buf = []
+            h_buf    = []
             for t in range(T):
                 x_t = torch.cat([ctx_f[:, t, :], pe_f[:, t, :], qp_f],
                                  dim=-1).unsqueeze(1)
                 h_t, h_f = self.gru(x_t, h_f)
-                pred_t = self.dec_out(self.dec_res(self.dec_in(h_t.squeeze(1))))
-                buf.append(pred_t)
+                h_t_sq   = h_t.squeeze(1)
+                h_buf.append(h_t_sq)
+                pred_t = self.dec_out(self.dec_res(self.dec_in(h_t_sq)))
+                traj_buf.append(pred_t)
                 qp_f = pred_t.detach()
-            out[f_idx] = torch.stack(buf, dim=1).to(dtype)
+            traj[f_idx]     = torch.stack(traj_buf, dim=1)
+            h_states[f_idx] = torch.stack(h_buf,    dim=1)
 
-        return out
+        quality = self.quality_head(h_states)
+        return traj, quality
 
 
 # ── WorldModel ─────────────────────────────────────────────────────────────────
@@ -249,9 +269,8 @@ class WorldModel(nn.Module):
         shape_embed = self.encoder(waypoints, wp_lengths)
         shape_embed = shape_embed + self.speed_proj(speed)
         T = targets.shape[1] if targets is not None else max_len
-        preds = self.decoder(shape_embed, T, targets=targets,
-                             p_teacher=p_teacher, q_init=q_init)
-        return preds, torch.tensor(0.0, device=preds.device)
+        return self.decoder(shape_embed, T, targets=targets,
+                            p_teacher=p_teacher, q_init=q_init)
 
     @torch.no_grad()
     def predict(self, waypoints, wp_lengths, speed, max_len=1300, q_init=None):

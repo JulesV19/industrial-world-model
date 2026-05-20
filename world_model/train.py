@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
@@ -48,7 +49,8 @@ DEFAULTS = dict(
     subsample_factor     = 1,        # sous-échantillonnage temporel (ex: 10 = 1 step sur 10)
     use_amp              = True,     # mixed precision BF16 (A100/T4 uniquement)
     target_keys          = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
-    error_weight_gamma   = 1.0,      # pondération par amplitude d'erreur : 0=désactivé, 1=linéaire, 2=quadratique
+    lambda_dev           = 1.0,      # poids de la loss cut_deviation (MSE, espace normalisé)
+    lambda_defect        = 0.5,      # poids de la loss cut_defect (BCE)
     ss_start_epoch       = 10,       # epoch où p_teacher commence à descendre (scheduled sampling)
     ss_end_epoch         = 60,       # epoch où p_teacher atteint ss_p_min
     ss_p_min             = 0.0,      # valeur finale de p_teacher (0 = full free-running)
@@ -63,34 +65,42 @@ def compute_loss(
     preds: torch.Tensor,
     targets: torch.Tensor,
     seq_lengths: torch.Tensor,
-    error_weight_gamma: float = 0.0,
-):
-    """MSE masqué, avec pondération optionnelle par amplitude des targets.
-
-    error_weight_gamma=0  → MSE classique
-    error_weight_gamma=1  → chaque séquence est pondérée proportionnellement
-                            au RMS de ses targets (séquences très erronées ×γ plus)
-    error_weight_gamma=2  → pondération quadratique, encore plus agressive
-    """
+) -> torch.Tensor:
+    """MSE masqué sur les séquences de longueurs variables."""
     B, T, D = preds.shape
     device  = preds.device
-    mask    = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()  # [B, T]
+    mask    = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
+    n       = mask.sum() * D + 1e-8
+    return ((preds - targets).pow(2) * mask[..., None]).sum() / n
 
-    if error_weight_gamma > 0.0:
-        # RMS des targets par séquence → proxy de l'amplitude d'erreur
-        seq_rms = (targets.pow(2) * mask[..., None]).sum(dim=(1, 2))   # [B]
-        seq_rms = seq_rms / (mask.sum(dim=1) * D + 1e-8)               # moyenne par step
-        seq_rms = seq_rms.sqrt()                                        # [B]
-        # Poids normalisés (mean=1 dans le batch pour stabiliser la magnitude de la loss)
-        w = seq_rms.pow(error_weight_gamma)
-        w = w / (w.mean() + 1e-8)                                      # [B]
-        w = w[:, None, None]                                            # [B, 1, 1]
-    else:
-        w = 1.0
 
-    n   = mask.sum() * D + 1e-8
-    mse = ((preds - targets).pow(2) * mask[..., None] * w).sum() / n
-    return mse
+def compute_quality_loss(
+    quality_preds: torch.Tensor,    # (B, T, 2)
+    cut_dev: torch.Tensor,          # (B, T) — normalisé
+    cut_defect: torch.Tensor,       # (B, T) — 0/1
+    is_cutting: torch.Tensor,       # (B, T) — masque
+    seq_lengths: torch.Tensor,
+    lambda_dev: float,
+    lambda_defect: float,
+) -> torch.Tensor:
+    B, T = cut_dev.shape
+    device = quality_preds.device
+    seq_mask = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
+    cut_mask = is_cutting * seq_mask   # (B, T) — actif uniquement pendant la découpe
+    n_cut    = cut_mask.sum() + 1e-8
+
+    loss = torch.tensor(0.0, device=device)
+    if lambda_dev > 0:
+        loss = loss + lambda_dev * (
+            (quality_preds[:, :, 0] - cut_dev).pow(2) * cut_mask
+        ).sum() / n_cut
+    if lambda_defect > 0:
+        loss = loss + lambda_defect * (
+            F.binary_cross_entropy_with_logits(
+                quality_preds[:, :, 1], cut_defect, reduction="none"
+            ) * cut_mask
+        ).sum() / n_cut
+    return loss
 
 
 # ── scheduled sampling ─────────────────────────────────────────────────────────
@@ -225,21 +235,30 @@ def train(cfg: dict | None = None):
         train_total     = 0.0
         total_grad_norm = 0.0
 
-        for wps, wp_len, speed, obs, seq_len in train_loader:
+        for wps, wp_len, speed, obs, seq_len, cut_dev, cut_defect, is_cutting in train_loader:
             wps, wp_len  = wps.to(device), wp_len.to(device)
             speed        = speed.to(device)
             obs, seq_len = obs.to(device), seq_len.to(device)
+            cut_dev      = cut_dev.to(device)
+            cut_defect   = cut_defect.to(device)
+            is_cutting   = is_cutting.to(device)
 
-            # Sous-échantillonnage temporel : réduit T avant le GRU
             if sf > 1:
-                obs     = obs[:, ::sf, :].contiguous()
-                seq_len = (seq_len + sf - 1) // sf
+                obs        = obs[:, ::sf, :].contiguous()
+                cut_dev    = cut_dev[:, ::sf].contiguous()
+                cut_defect = cut_defect[:, ::sf].contiguous()
+                is_cutting = is_cutting[:, ::sf].contiguous()
+                seq_len    = (seq_len + sf - 1) // sf
 
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                preds, _ = model(wps, wp_len, speed, targets=obs,
-                                 p_teacher=p_teacher, q_init=q_init_dev)
-                loss     = compute_loss(preds, obs, seq_len, H["error_weight_gamma"])
+                preds, quality = model(wps, wp_len, speed, targets=obs,
+                                       p_teacher=p_teacher, q_init=q_init_dev)
+                loss = compute_loss(preds, obs, seq_len)
+                loss = loss + compute_quality_loss(
+                    quality, cut_dev, cut_defect, is_cutting, seq_len,
+                    H["lambda_dev"], H["lambda_defect"],
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
@@ -256,17 +275,28 @@ def train(cfg: dict | None = None):
         model.eval()
         val_total = 0.0
         with torch.no_grad():
-            for wps, wp_len, speed, obs, seq_len in val_loader:
+            for wps, wp_len, speed, obs, seq_len, cut_dev, cut_defect, is_cutting in val_loader:
                 wps, wp_len  = wps.to(device), wp_len.to(device)
                 speed        = speed.to(device)
                 obs, seq_len = obs.to(device), seq_len.to(device)
+                cut_dev      = cut_dev.to(device)
+                cut_defect   = cut_defect.to(device)
+                is_cutting   = is_cutting.to(device)
                 if sf > 1:
-                    obs     = obs[:, ::sf, :].contiguous()
-                    seq_len = (seq_len + sf - 1) // sf
+                    obs        = obs[:, ::sf, :].contiguous()
+                    cut_dev    = cut_dev[:, ::sf].contiguous()
+                    cut_defect = cut_defect[:, ::sf].contiguous()
+                    is_cutting = is_cutting[:, ::sf].contiguous()
+                    seq_len    = (seq_len + sf - 1) // sf
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    preds, _ = model(wps, wp_len, speed, targets=obs,
-                                     p_teacher=1.0, q_init=q_init_dev)
-                    val_total += compute_loss(preds, obs, seq_len, H["error_weight_gamma"]).item()
+                    preds, quality = model(wps, wp_len, speed, targets=obs,
+                                           p_teacher=1.0, q_init=q_init_dev)
+                    val_loss = compute_loss(preds, obs, seq_len)
+                    val_loss = val_loss + compute_quality_loss(
+                        quality, cut_dev, cut_defect, is_cutting, seq_len,
+                        H["lambda_dev"], H["lambda_defect"],
+                    )
+                    val_total += val_loss.item()
 
         avg_train     = train_total     / len(train_loader)
         avg_val       = val_total       / len(val_loader)
@@ -290,6 +320,8 @@ def train(cfg: dict | None = None):
                     "model_state": model.state_dict(),
                     "hyperparams": H,
                     "val_loss": avg_val,
+                    "dev_mean": full_ds.dev_mean,
+                    "dev_std":  full_ds.dev_std,
                 },
                 os.path.join(H["save_dir"], "best_model.pt"),
             )

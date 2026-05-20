@@ -122,6 +122,7 @@ class TrajectoryDataset(Dataset):
 
         raw_trajs = []
         meta      = []
+        quality   = []
 
         for ep_path in sorted(episode_paths):
             idx       = int(os.path.basename(ep_path).split("_")[1].split(".")[0]) - 1
@@ -131,19 +132,36 @@ class TrajectoryDataset(Dataset):
             speed     = float(data["duration_per_segment"])
             raw_trajs.append(obs)
             meta.append((waypoints, speed, len(obs)))
+            quality.append({
+                "cut_deviation": data["cut_deviation"].astype(np.float32),
+                "cut_defect":    data["cut_defect"].astype(np.float32),
+                "is_cutting":    data["is_cutting"].astype(np.float32),
+            })
 
         if normalizer is None:
             normalizer = Normalizer()
             normalizer.fit(raw_trajs, keys=target_keys)
         self.normalizer = normalizer
 
+        # Normalisation de cut_deviation : z-score sur les steps de découpe
+        all_dev = np.concatenate([
+            q["cut_deviation"][q["is_cutting"] > 0.5] for q in quality
+            if (q["is_cutting"] > 0.5).any()
+        ])
+        self.dev_mean = float(all_dev.mean())
+        self.dev_std  = float(all_dev.std() + 1e-6)
+
         self.samples = []
-        for (waypoints, speed, seq_len), obs in zip(meta, raw_trajs):
+        for (waypoints, speed, seq_len), obs, q in zip(meta, raw_trajs, quality):
+            dev_norm = (q["cut_deviation"] - self.dev_mean) / self.dev_std
             self.samples.append({
-                "waypoints": waypoints,
-                "speed":     np.float32(speed),
-                "obs":       normalizer.normalize(obs),
-                "length":    seq_len,
+                "waypoints":     waypoints,
+                "speed":         np.float32(speed),
+                "obs":           normalizer.normalize(obs),
+                "length":        seq_len,
+                "cut_deviation": dev_norm.astype(np.float32),
+                "cut_defect":    q["cut_defect"],
+                "is_cutting":    q["is_cutting"],
             })
 
     def __len__(self):
@@ -156,16 +174,22 @@ class TrajectoryDataset(Dataset):
             torch.tensor(s["speed"]),
             torch.from_numpy(s["obs"]),
             s["length"],
+            torch.from_numpy(s["cut_deviation"]),
+            torch.from_numpy(s["cut_defect"]),
+            torch.from_numpy(s["is_cutting"]),
         )
 
 
 # ---------------------------------------------------------------------------
 def collate_fn(batch):
-    waypoints_list, speeds, obs_list, lengths = zip(*batch)
+    waypoints_list, speeds, obs_list, lengths, dev_list, defect_list, cut_list = zip(*batch)
     return (
         pad_sequence(waypoints_list, batch_first=True, padding_value=0.0),
         torch.tensor([w.shape[0] for w in waypoints_list]),
-        torch.stack(speeds).unsqueeze(-1),          # (B, 1)
-        pad_sequence(obs_list, batch_first=True, padding_value=0.0),
+        torch.stack(speeds).unsqueeze(-1),                        # (B, 1)
+        pad_sequence(obs_list,    batch_first=True, padding_value=0.0),
         torch.tensor(lengths),
+        pad_sequence(dev_list,    batch_first=True, padding_value=0.0),  # (B, T)
+        pad_sequence(defect_list, batch_first=True, padding_value=0.0),  # (B, T)
+        pad_sequence(cut_list,    batch_first=True, padding_value=0.0),  # (B, T)
     )
