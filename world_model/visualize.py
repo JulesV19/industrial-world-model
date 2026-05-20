@@ -80,7 +80,7 @@ def _load(save_dir: str, device: torch.device):
 
 # ── helpers dataset ────────────────────────────────────────────────────────────
 def _get_split(save_dir, split, device):
-    """Retourne (model, norm, H, full_ds, subset, q_init, dev_mean, dev_std)."""
+    """Retourne (model, norm, H, full_ds, subset, dev_mean, dev_std)."""
     model, norm, H, dev_mean, dev_std = _load(save_dir, device)
     with open(H["db_path"]) as f:
         piece_db = json.load(f)["pieces"]
@@ -93,22 +93,10 @@ def _get_split(save_dir, split, device):
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
     subset  = {"val": val_ds, "train": train_ds}.get(split, full_ds)
 
-    target_keys = H.get("target_keys") or [k for k, _ in METRIC_KEYS]
-    if isinstance(target_keys, str):
-        target_keys = [k.strip() for k in target_keys.split(",")]
-    obs_dim = H.get("obs_dim", 2)
-    if all(k == "q_error" for k in target_keys):
-        q_init_raw = np.zeros(obs_dim, dtype=np.float32)
-    else:
-        q_home = inverse_kinematics(0.1, 0.1).astype(np.float32)
-        q_init_raw = np.zeros(obs_dim, dtype=np.float32)
-        q_init_raw[:2] = q_home
-    q_init = torch.tensor(norm.normalize(q_init_raw[None])[0]).to(device)
-
-    return model, norm, H, full_ds, subset, q_init, dev_mean, dev_std
+    return model, norm, H, full_ds, subset, dev_mean, dev_std
 
 
-def _compute_loss_distribution(model, norm, H, full_ds, subset, device, q_init,
+def _compute_loss_distribution(model, norm, H, full_ds, subset, device,
                                batch_size: int = 32):
     """Calcule la MSE loss (sur q) pour chaque épisode — inférence batché."""
     n_ep = len(subset)
@@ -149,7 +137,7 @@ def _compute_loss_distribution(model, norm, H, full_ds, subset, device, q_init,
         try:
             with torch.no_grad():
                 pred_norm, _ = model.predict(wps_t, wp_lens, speeds,
-                                             max_len=max_n_sub, q_init=q_init)
+                                             max_len=max_n_sub)
             pred_np = norm.denormalize_tensor(pred_norm).cpu().numpy()
 
             for k in range(B):
@@ -185,7 +173,7 @@ def _upsample(arr: np.ndarray, sf: int, T_full: int) -> np.ndarray:
     )
 
 
-def _run_inference(model, norm, H, full_ds, subset, ep_idx, device, q_init,
+def _run_inference(model, norm, H, full_ds, subset, ep_idx, device,
                    dev_mean: float = 0.0, dev_std: float = 1.0):
     """Inférence sur un épisode.
 
@@ -211,7 +199,7 @@ def _run_inference(model, norm, H, full_ds, subset, ep_idx, device, q_init,
 
     with torch.no_grad():
         pred_norm, quality_norm = model.predict(wps_t, wp_len, speed,
-                                                max_len=n_steps, q_init=q_init)
+                                                max_len=n_steps)
 
     pred_np    = pred_norm[0].cpu().numpy()         # (n_steps, D)
     quality_np = quality_norm[0].cpu().numpy()      # (n_steps, 2)
@@ -275,12 +263,12 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
     import matplotlib.widgets as mwidgets
 
     device = get_device()
-    model, norm, H, full_ds, subset, q_init, dev_mean, dev_std = _get_split(
+    model, norm, H, full_ds, subset, dev_mean, dev_std = _get_split(
         save_dir, split, device)
     n_ep = len(subset)
 
     all_losses = _compute_loss_distribution(model, norm, H, full_ds, subset,
-                                            device, q_init)
+                                            device)
 
     _UNITS = {"q_real":"rad","q_des":"rad","q_sensed":"rad",
               "dq_real":"rad/s","dq_des":"rad/s","dq_sensed":"rad/s",
@@ -371,7 +359,7 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
 
     def _load_ep(ep_idx):
         pred, tgt, waypoints, seq_len, q_col, target_keys, quality = _run_inference(
-            model, norm, H, full_ds, subset, ep_idx, device, q_init,
+            model, norm, H, full_ds, subset, ep_idx, device,
             dev_mean, dev_std)
         q_pred = pred[:seq_len, q_col:q_col + 2]
         q_true = tgt [:seq_len, q_col:q_col + 2]
@@ -577,7 +565,7 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
 def animate(episode_idx=None, save_dir="world_model/checkpoints",
             save_path=None, step=3, split="val"):
     device = get_device()
-    model, norm, H, full_ds, subset, q_init, dev_mean, dev_std = _get_split(
+    model, norm, H, full_ds, subset, dev_mean, dev_std = _get_split(
         save_dir, split, device)
 
     if episode_idx is None:
@@ -585,7 +573,7 @@ def animate(episode_idx=None, save_dir="world_model/checkpoints",
     episode_idx = episode_idx % len(subset)
 
     pred, tgt, waypoints, seq_len, q_col, target_keys, quality = _run_inference(
-        model, norm, H, full_ds, subset, episode_idx, device, q_init,
+        model, norm, H, full_ds, subset, episode_idx, device,
         dev_mean, dev_std)
 
     q_pred = pred[:seq_len, q_col:q_col + 2]
