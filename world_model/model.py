@@ -104,10 +104,11 @@ class TemporalDecoder(nn.Module):
         super().__init__()
         self.h_dim      = h_dim
         self.gru_layers = gru_layers
+        self.obs_dim    = obs_dim
 
         self.pe = SinusoidalPE(pe_dim, max_len=20000)
 
-        gru_input = shape_embed_dim + pe_dim
+        gru_input = shape_embed_dim + pe_dim + obs_dim   # +obs_dim : q_prev autorégressif
         self.gru  = nn.GRU(gru_input, h_dim, num_layers=gru_layers,
                            batch_first=True, dropout=dropout)
 
@@ -125,30 +126,67 @@ class TemporalDecoder(nn.Module):
         )
         self.dec_out = nn.Linear(h_dim, obs_dim)
 
-    def forward(self, shape_embed: torch.Tensor, T: int) -> torch.Tensor:
+    def forward(
+        self,
+        shape_embed: torch.Tensor,
+        T:           int,
+        targets:     torch.Tensor | None = None,
+        p_teacher:   float               = 1.0,
+        q_init:      torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         shape_embed : (B, E)
         T           : longueur de séquence à générer
+        targets     : (B, T, obs_dim) — ground truth pour teacher forcing
+        p_teacher   : probabilité d'utiliser le ground truth à chaque step (1.0 = pur TF)
+        q_init      : (B, obs_dim) ou (obs_dim,) — état initial normalisé
         returns     : (B, T, obs_dim)
         """
-        B, E = shape_embed.shape
+        B, E   = shape_embed.shape
+        device = shape_embed.device
+        dtype  = shape_embed.dtype
 
-        # Initialisation de l'état caché
         h0 = self.h_init(shape_embed) \
                  .view(B, self.gru_layers, self.h_dim) \
                  .permute(1, 0, 2).contiguous()          # (L, B, h_dim)
 
-        # Entrée : shape_embed + encodage positionnel (varie à chaque step)
-        pe  = self.pe(T).unsqueeze(0).expand(B, T, -1)                # (B, T, pe_dim)
-        ctx = shape_embed.unsqueeze(1).expand(B, T, E)                # (B, T, E)
-        x   = torch.cat([ctx, pe], dim=-1).contiguous()               # (B, T, E+pe_dim)
+        pe  = self.pe(T).unsqueeze(0).expand(B, T, -1)  # (B, T, pe_dim)
+        ctx = shape_embed.unsqueeze(1).expand(B, T, E)  # (B, T, E)
 
-        h_seq, _ = self.gru(x, h0)                                    # (B, T, h_dim)
+        # État initial : IK(HOME) normalisé (fourni par train.py), sinon zéros
+        if q_init is None:
+            q_prev = torch.zeros(B, self.obs_dim, device=device, dtype=dtype)
+        else:
+            q_prev = q_init.to(device=device, dtype=dtype)
+            if q_prev.dim() == 1:
+                q_prev = q_prev.unsqueeze(0).expand(B, -1)
 
-        # Décodage résiduel
-        out = self.dec_in(h_seq)
-        out = self.dec_res(out)
-        return self.dec_out(out)                                       # (B, T, obs_dim)
+        # ── Chemin rapide : teacher forcing pur → un seul appel GRU batché ──
+        if p_teacher >= 1.0 and targets is not None:
+            # Décaler les targets d'un pas : [q_init, t0, t1, …, t_{T-2}]
+            q_shifted = torch.cat([q_prev.unsqueeze(1), targets[:, :-1, :]], dim=1)
+            x = torch.cat([ctx, pe, q_shifted], dim=-1).contiguous()
+            h_seq, _ = self.gru(x, h0)
+            out = self.dec_in(h_seq)
+            out = self.dec_res(out)
+            return self.dec_out(out)                     # (B, T, obs_dim)
+
+        # ── Chemin lent : scheduled sampling step-by-step ──
+        outputs = []
+        h = h0
+        for t in range(T):
+            x_t = torch.cat([ctx[:, t, :], pe[:, t, :], q_prev], dim=-1).unsqueeze(1)
+            h_t, h = self.gru(x_t, h)
+            pred_t = self.dec_out(self.dec_res(self.dec_in(h_t.squeeze(1))))
+            outputs.append(pred_t)
+
+            if targets is not None and t < T - 1:
+                use_gt = (torch.rand(1, device=device).item() < p_teacher)
+                q_prev = targets[:, t, :] if use_gt else pred_t.detach()
+            else:
+                q_prev = pred_t.detach()
+
+        return torch.stack(outputs, dim=1)               # (B, T, obs_dim)
 
 
 # ── WorldModel ─────────────────────────────────────────────────────────────────
@@ -178,19 +216,23 @@ class WorldModel(nn.Module):
             pe_dim=pe_dim, gru_layers=gru_layers, dropout=dropout,
         )
 
-    def forward(self, waypoints, wp_lengths, speed, targets=None, max_len=1300):
+    def forward(self, waypoints, wp_lengths, speed, targets=None, max_len=1300,
+                p_teacher=1.0, q_init=None):
         """
-        speed : (B, 1) float — duration_per_segment en secondes
+        speed     : (B, 1) float — duration_per_segment en secondes
+        p_teacher : probabilité teacher forcing (1.0 = pur TF, 0.0 = free-running)
+        q_init    : (obs_dim,) ou (B, obs_dim) — état initial normalisé du décodeur
         """
         shape_embed = self.encoder(waypoints, wp_lengths)
         shape_embed = shape_embed + self.speed_proj(speed)
         T = targets.shape[1] if targets is not None else max_len
-        preds = self.decoder(shape_embed, T)
+        preds = self.decoder(shape_embed, T, targets=targets,
+                             p_teacher=p_teacher, q_init=q_init)
         return preds, torch.tensor(0.0, device=preds.device)
 
     @torch.no_grad()
-    def predict(self, waypoints, wp_lengths, speed, max_len=1300):
+    def predict(self, waypoints, wp_lengths, speed, max_len=1300, q_init=None):
         self.eval()
         shape_embed = self.encoder(waypoints, wp_lengths)
         shape_embed = shape_embed + self.speed_proj(speed)
-        return self.decoder(shape_embed, max_len)
+        return self.decoder(shape_embed, max_len, p_teacher=0.0, q_init=q_init)

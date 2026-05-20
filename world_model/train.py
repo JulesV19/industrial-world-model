@@ -10,6 +10,7 @@ import argparse
 import glob
 import json
 import os
+import sys
 import time
 
 import matplotlib.pyplot as plt
@@ -22,6 +23,10 @@ from tqdm import tqdm
 
 from .dataset import TrajectoryDataset, collate_fn, target_dim
 from .model import WorldModel
+
+# IK disponible depuis le répertoire parent
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from arm import inverse_kinematics
 
 # ── default hyperparameters ────────────────────────────────────────────────────
 DEFAULTS = dict(
@@ -44,6 +49,9 @@ DEFAULTS = dict(
     use_amp              = True,     # mixed precision BF16 (A100/T4 uniquement)
     target_keys          = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
     error_weight_gamma   = 1.0,      # pondération par amplitude d'erreur : 0=désactivé, 1=linéaire, 2=quadratique
+    ss_start_epoch       = 10,       # epoch où p_teacher commence à descendre (scheduled sampling)
+    ss_end_epoch         = 60,       # epoch où p_teacher atteint ss_p_min
+    ss_p_min             = 0.0,      # valeur finale de p_teacher (0 = full free-running)
     save_dir             = "world_model/checkpoints",
     data_dir             = "dataset",
     db_path              = "pieces_database.json",
@@ -85,6 +93,17 @@ def compute_loss(
     return mse
 
 
+# ── scheduled sampling ─────────────────────────────────────────────────────────
+def get_p_teacher(epoch: int, ss_start: int, ss_end: int, p_min: float) -> float:
+    """Décroissance linéaire de p_teacher de 1.0 vers p_min entre ss_start et ss_end."""
+    if epoch <= ss_start:
+        return 1.0
+    if epoch >= ss_end:
+        return p_min
+    progress = (epoch - ss_start) / max(ss_end - ss_start, 1)
+    return 1.0 - progress * (1.0 - p_min)
+
+
 # ── device ─────────────────────────────────────────────────────────────────────
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -121,6 +140,22 @@ def train(cfg: dict | None = None):
 
     full_ds = TrajectoryDataset(episode_paths, piece_db, target_keys=target_keys)
     full_ds.normalizer.save(os.path.join(H["save_dir"], "normalizer.npz"))
+
+    # ── q_init : état initial du décodeur autorégressif ───────────────────────
+    # Le bras démarre toujours à HOME = (0.1, 0.1) en espace cartésien.
+    # Pour q_error (= q_real - q_des) l'erreur initiale est ≈ 0 → vecteur nul.
+    # Pour q_real / q_des on utilise IK(HOME) normalisé.
+    _HOME = (0.1, 0.1)
+    if all(k == "q_error" for k in target_keys):
+        _q_init_raw = np.zeros(obs_dim, dtype=np.float32)
+    else:
+        _q_home = inverse_kinematics(*_HOME).astype(np.float32)   # (2,)
+        # Si obs_dim > 2 (plusieurs signaux), répliquer / compléter par zéros
+        _q_init_raw = np.zeros(obs_dim, dtype=np.float32)
+        _q_init_raw[:2] = _q_home
+    q_init = torch.tensor(
+        full_ds.normalizer.normalize(_q_init_raw[None])[0]
+    )   # (obs_dim,) — diffusé sur le batch dans le décodeur
 
     n_val   = max(1, int(len(full_ds) * H["val_split"]))
     n_train = len(full_ds) - n_val
@@ -175,11 +210,15 @@ def train(cfg: dict | None = None):
     if sf > 1:
         print(f"Sous-échantillonnage : 1 step sur {sf} (T divisé par {sf})")
 
+    q_init_dev = q_init.to(device)   # (obs_dim,) — partagé sur tout l'entraînement
+
     # ── epoch loop ────────────────────────────────────────────────────────────
     epoch_bar = tqdm(range(1, H["epochs"] + 1), desc="Training", unit="epoch")
 
     for epoch in epoch_bar:
-        t_epoch = time.time()
+        t_epoch   = time.time()
+        p_teacher = get_p_teacher(epoch, H["ss_start_epoch"],
+                                  H["ss_end_epoch"], H["ss_p_min"])
 
         # --- train ---
         model.train()
@@ -198,7 +237,8 @@ def train(cfg: dict | None = None):
 
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                preds, _ = model(wps, wp_len, speed, targets=obs)
+                preds, _ = model(wps, wp_len, speed, targets=obs,
+                                 p_teacher=p_teacher, q_init=q_init_dev)
                 loss     = compute_loss(preds, obs, seq_len, H["error_weight_gamma"])
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -209,11 +249,10 @@ def train(cfg: dict | None = None):
             train_total     += loss.item()
             total_grad_norm += grad_norm.item()
 
-
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        # --- validate ---
+        # --- validate --- (toujours en teacher forcing pour comparer proprement)
         model.eval()
         val_total = 0.0
         with torch.no_grad():
@@ -225,7 +264,8 @@ def train(cfg: dict | None = None):
                     obs     = obs[:, ::sf, :].contiguous()
                     seq_len = (seq_len + sf - 1) // sf
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    preds, _ = model(wps, wp_len, speed, targets=obs)
+                    preds, _ = model(wps, wp_len, speed, targets=obs,
+                                     p_teacher=1.0, q_init=q_init_dev)
                     val_total += compute_loss(preds, obs, seq_len, H["error_weight_gamma"]).item()
 
         avg_train     = train_total     / len(train_loader)
@@ -258,11 +298,12 @@ def train(cfg: dict | None = None):
 
         marker = " ★" if improved else f" ({epochs_no_imp})"
         epoch_bar.set_postfix(
-            val=f"{avg_val:.4f}", best=f"{best_val:.4f}", lr=f"{current_lr:.2e}"
+            val=f"{avg_val:.4f}", best=f"{best_val:.4f}",
+            lr=f"{current_lr:.2e}", tf=f"{p_teacher:.2f}"
         )
         tqdm.write(
             f"[{epoch:3d}/{H['epochs']}] {epoch_time:5.1f}s  ETA {_fmt_time(eta)}  "
-            f"lr={current_lr:.2e}  ‖g‖={avg_grad_norm:.2f}  "
+            f"lr={current_lr:.2e}  tf={p_teacher:.2f}  ‖g‖={avg_grad_norm:.2f}  "
             f"train={avg_train:.4f}  val={avg_val:.4f}{marker}"
         )
 
