@@ -65,7 +65,7 @@ def _traj_loss(pred: torch.Tensor, target: torch.Tensor,
     idx = torch.arange(T, device=pred.device).unsqueeze(0)   # (1, T)
     mask = idx < lengths.unsqueeze(1)                         # (B, T)
     mask = mask.unsqueeze(-1).expand_as(pred)                 # (B, T, 2)
-    return F.mse_loss(pred[mask], target[mask])
+    return F.smooth_l1_loss(pred[mask], target[mask], beta=0.1)
 
 
 def train(cfg: dict | None = None):

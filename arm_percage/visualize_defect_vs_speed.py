@@ -38,8 +38,8 @@ def load_real_records(data_dir: str) -> list[dict]:
 
 def load_model_records(data_dir: str, model_path: str) -> list[dict]:
     import torch
-    from world_model.model import DrillModel
-    from world_model.dataset import Normalizer
+    from world_model.model import DrillWorldModel
+    from world_model.dataset import Normalizer, TrajNormalizer
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Checkpoint introuvable : {model_path}")
@@ -52,9 +52,13 @@ def load_model_records(data_dir: str, model_path: str) -> list[dict]:
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
     H    = ckpt.get("hyperparams", {})
 
-    model = DrillModel(
+    model = DrillWorldModel(
         corner_embed_dim = H.get("corner_embed_dim", 64),
-        global_dim       = H.get("global_dim", 256),
+        embed_dim        = H.get("embed_dim", 256),
+        h_dim            = H.get("h_dim", 512),
+        pe_dim           = H.get("pe_dim", 64),
+        gru_layers       = H.get("gru_layers", 2),
+        n_attn_heads     = H.get("n_attn_heads", 4),
         dropout          = 0.0,
     )
     model.load_state_dict(ckpt["model_state"])
@@ -70,12 +74,13 @@ def load_model_records(data_dir: str, model_path: str) -> list[dict]:
         data    = np.load(ep_path)
         corners = data["corner_targets"].astype(np.float32)   # (4, 2)
         speed   = float(data["duration_per_segment"])
+        length  = data["q_real"].shape[0]
 
         corners_t = torch.from_numpy(corners).unsqueeze(0).to(device)
         speed_t   = torch.tensor([[speed]], dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            offsets_norm, defect_logits = model(corners_t, speed_t)
+            _, offsets_norm, defect_logits = model(corners_t, speed_t, T=length)
 
         offsets = normalizer.denormalize(offsets_norm[0].cpu().numpy())   # (4, 2) m
         errors  = np.linalg.norm(offsets, axis=1)                         # (4,) m
