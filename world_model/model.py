@@ -190,7 +190,7 @@ class TemporalDecoder(nn.Module):
             h_seq, _ = self.gru(x, h0[:, t_idx, :].contiguous())
             h_seq = self.dec_in(h_seq)
             h_seq = self.dec_res(h_seq)
-            out[t_idx] = self.dec_out(h_seq)
+            out[t_idx] = self.dec_out(h_seq).to(dtype)
 
         # — sous-batch free-running : boucle step-by-step —
         if f_idx.numel() > 0:
@@ -207,7 +207,7 @@ class TemporalDecoder(nn.Module):
                 pred_t = self.dec_out(self.dec_res(self.dec_in(h_t.squeeze(1))))
                 buf.append(pred_t)
                 qp_f = pred_t.detach()
-            out[f_idx] = torch.stack(buf, dim=1)
+            out[f_idx] = torch.stack(buf, dim=1).to(dtype)
 
         return out
 
