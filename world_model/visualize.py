@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import random
+import sys
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -32,6 +33,9 @@ from .dataset import (
 )
 from .model import WorldModel
 from .train import DEFAULTS, get_device
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from arm import inverse_kinematics
 
 
 # ── cinématique directe ────────────────────────────────────────────────────────
@@ -73,7 +77,7 @@ def _load(save_dir: str, device: torch.device):
 
 # ── helpers dataset ────────────────────────────────────────────────────────────
 def _get_split(save_dir, split, device):
-    """Retourne (model, norm, H, full_ds, subset) pour le split demandé."""
+    """Retourne (model, norm, H, full_ds, subset, q_init) pour le split demandé."""
     model, norm, H = _load(save_dir, device)
     with open(H["db_path"]) as f:
         piece_db = json.load(f)["pieces"]
@@ -85,10 +89,24 @@ def _get_split(save_dir, split, device):
     g       = torch.Generator().manual_seed(H["seed"])
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
     subset  = {"val": val_ds, "train": train_ds}.get(split, full_ds)
-    return model, norm, H, full_ds, subset
+
+    # État initial du décodeur autorégressif (même logique que train.py)
+    target_keys = H.get("target_keys") or [k for k, _ in METRIC_KEYS]
+    if isinstance(target_keys, str):
+        target_keys = [k.strip() for k in target_keys.split(",")]
+    obs_dim = H.get("obs_dim", 2)
+    if all(k == "q_error" for k in target_keys):
+        q_init_raw = np.zeros(obs_dim, dtype=np.float32)
+    else:
+        q_home = inverse_kinematics(0.1, 0.1).astype(np.float32)
+        q_init_raw = np.zeros(obs_dim, dtype=np.float32)
+        q_init_raw[:2] = q_home
+    q_init = torch.tensor(norm.normalize(q_init_raw[None])[0]).to(device)
+
+    return model, norm, H, full_ds, subset, q_init
 
 
-def _compute_loss_distribution(model, norm, H, full_ds, subset, device,
+def _compute_loss_distribution(model, norm, H, full_ds, subset, device, q_init,
                                batch_size: int = 32):
     """Calcule la MSE loss (sur q) pour chaque épisode — inférence batché."""
     from torch.nn.utils.rnn import pad_sequence
@@ -129,7 +147,8 @@ def _compute_loss_distribution(model, norm, H, full_ds, subset, device,
 
         try:
             with torch.no_grad():
-                pred_norm, _ = model(wps_t, wp_lens, speeds, max_len=max_n_sub)
+                pred_norm = model.predict(wps_t, wp_lens, speeds,
+                                          max_len=max_n_sub, q_init=q_init)
             pred_np = norm.denormalize_tensor(pred_norm).cpu().numpy()  # (B, max_n_sub, D)
 
             for k in range(B):
@@ -164,7 +183,7 @@ def _upsample(arr: np.ndarray, sf: int, T_full: int) -> np.ndarray:
     )
 
 
-def _run_inference(model, norm, H, full_ds, subset, ep_idx, device):
+def _run_inference(model, norm, H, full_ds, subset, ep_idx, device, q_init):
     """Inférence sur un épisode → (pred, tgt, waypoints, seq_len, q_col)."""
     wps_t, speed_t, obs_norm_t, seq_len = subset[ep_idx]
     wps_t   = wps_t.unsqueeze(0).to(device)
@@ -176,7 +195,7 @@ def _run_inference(model, norm, H, full_ds, subset, ep_idx, device):
     n_steps = math.ceil(T / sf)
 
     with torch.no_grad():
-        pred_norm, _ = model(wps_t, wp_len, speed, max_len=n_steps)
+        pred_norm = model.predict(wps_t, wp_len, speed, max_len=n_steps, q_init=q_init)
     pred_norm = pred_norm[0].cpu().numpy()   # (n_steps, D)
     tgt_norm  = obs_norm_t.numpy()           # (T, D)
 
@@ -220,11 +239,11 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
     import matplotlib.widgets as mwidgets
 
     device = get_device()
-    model, norm, H, full_ds, subset = _get_split(save_dir, split, device)
+    model, norm, H, full_ds, subset, q_init = _get_split(save_dir, split, device)
     n_ep   = len(subset)
 
     # ── calcul distribution des losses ───────────────────────────────────────
-    all_losses = _compute_loss_distribution(model, norm, H, full_ds, subset, device)
+    all_losses = _compute_loss_distribution(model, norm, H, full_ds, subset, device, q_init)
 
     _UNITS = {"q_real":"rad","q_des":"rad","q_sensed":"rad",
               "dq_real":"rad/s","dq_des":"rad/s","dq_sensed":"rad/s",
@@ -318,7 +337,7 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
     # ── chargement d'un épisode ───────────────────────────────────────────────
     def _load_ep(ep_idx):
         pred, tgt, waypoints, seq_len, q_col, target_keys = _run_inference(
-            model, norm, H, full_ds, subset, ep_idx, device)
+            model, norm, H, full_ds, subset, ep_idx, device, q_init)
         q_pred = pred[:seq_len, q_col:q_col + 2]
         q_true = tgt [:seq_len, q_col:q_col + 2]
         _, elbow_p, tip_p = fk(q_pred)
@@ -480,14 +499,14 @@ def browse(save_dir="world_model/checkpoints", split="val", step=1):
 def animate(episode_idx=None, save_dir="world_model/checkpoints",
             save_path=None, step=3, split="val"):
     device = get_device()
-    model, norm, H, full_ds, subset = _get_split(save_dir, split, device)
+    model, norm, H, full_ds, subset, q_init = _get_split(save_dir, split, device)
 
     if episode_idx is None:
         episode_idx = random.randint(0, len(subset) - 1)
     episode_idx = episode_idx % len(subset)
 
     pred, tgt, waypoints, seq_len, q_col, target_keys = _run_inference(
-        model, norm, H, full_ds, subset, episode_idx, device)
+        model, norm, H, full_ds, subset, episode_idx, device, q_init)
 
     q_pred = pred[:seq_len, q_col:q_col + 2]
     q_true = tgt [:seq_len, q_col:q_col + 2]

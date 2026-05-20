@@ -138,7 +138,7 @@ class TemporalDecoder(nn.Module):
         shape_embed : (B, E)
         T           : longueur de séquence à générer
         targets     : (B, T, obs_dim) — ground truth pour teacher forcing
-        p_teacher   : probabilité d'utiliser le ground truth à chaque step (1.0 = pur TF)
+        p_teacher   : probabilité par séquence d'utiliser le teacher forcing (1.0 = pur TF)
         q_init      : (B, obs_dim) ou (obs_dim,) — état initial normalisé
         returns     : (B, T, obs_dim)
         """
@@ -171,22 +171,45 @@ class TemporalDecoder(nn.Module):
             out = self.dec_res(out)
             return self.dec_out(out)                     # (B, T, obs_dim)
 
-        # ── Chemin lent : scheduled sampling step-by-step ──
-        outputs = []
-        h = h0
-        for t in range(T):
-            x_t = torch.cat([ctx[:, t, :], pe[:, t, :], q_prev], dim=-1).unsqueeze(1)
-            h_t, h = self.gru(x_t, h)
-            pred_t = self.dec_out(self.dec_res(self.dec_in(h_t.squeeze(1))))
-            outputs.append(pred_t)
+        # ── Scheduled sampling par séquence ──
+        # Chaque séquence tire son label une seule fois : teacher ou free-running.
+        # Les séquences teacher sont traitées en un seul appel GRU batché (chemin
+        # rapide) ; les séquences free-running font la boucle step-by-step sur un
+        # sous-batch réduit.
+        is_teacher = torch.rand(B, device=device) < p_teacher   # (B,) bool
+        t_idx = is_teacher.nonzero(as_tuple=True)[0]            # indices teacher
+        f_idx = (~is_teacher).nonzero(as_tuple=True)[0]         # indices free-running
 
-            if targets is not None and t < T - 1:
-                use_gt = (torch.rand(1, device=device).item() < p_teacher)
-                q_prev = targets[:, t, :] if use_gt else pred_t.detach()
-            else:
-                q_prev = pred_t.detach()
+        out = torch.empty(B, T, self.obs_dim, device=device, dtype=dtype)
 
-        return torch.stack(outputs, dim=1)               # (B, T, obs_dim)
+        # — sous-batch teacher : un seul appel GRU —
+        if t_idx.numel() > 0:
+            q_shifted = torch.cat([q_prev[t_idx].unsqueeze(1),
+                                   targets[t_idx, :-1, :]], dim=1)
+            x = torch.cat([ctx[t_idx], pe[t_idx], q_shifted], dim=-1).contiguous()
+            h_seq, _ = self.gru(x, h0[:, t_idx, :].contiguous())
+            h_seq = self.dec_in(h_seq)
+            h_seq = self.dec_res(h_seq)
+            out[t_idx] = self.dec_out(h_seq)
+
+        # — sous-batch free-running : boucle step-by-step —
+        if f_idx.numel() > 0:
+            Bf   = f_idx.numel()
+            h_f  = h0[:, f_idx, :].contiguous()
+            qp_f = q_prev[f_idx]
+            ctx_f = ctx[f_idx]
+            pe_f  = pe[f_idx]
+            buf  = []
+            for t in range(T):
+                x_t = torch.cat([ctx_f[:, t, :], pe_f[:, t, :], qp_f],
+                                 dim=-1).unsqueeze(1)
+                h_t, h_f = self.gru(x_t, h_f)
+                pred_t = self.dec_out(self.dec_res(self.dec_in(h_t.squeeze(1))))
+                buf.append(pred_t)
+                qp_f = pred_t.detach()
+            out[f_idx] = torch.stack(buf, dim=1)
+
+        return out
 
 
 # ── WorldModel ─────────────────────────────────────────────────────────────────
