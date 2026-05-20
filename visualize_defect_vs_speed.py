@@ -160,7 +160,7 @@ def load_model_records(data_dir: str, piece_db: list, model_path: str,
 
         try:
             with torch.no_grad():
-                pred_norm = model.predict(wps_t, wp_lens, speeds_t, max_len=bt_sub)
+                pred_norm, _ = model.predict(wps_t, wp_lens, speeds_t, max_len=bt_sub)
             pred_cpu = normalizer.denormalize_tensor(pred_norm).cpu().numpy()
             q_pred_all[start:end, :bt_sub, :] = pred_cpu
             print(f"  Inférence épisodes {start+1}–{end}/{N}…", end="\r")
@@ -182,7 +182,6 @@ def load_model_records(data_dir: str, piece_db: list, model_path: str,
         q_des_sub_padded[i, :n] = all_q_des[i][::sf, :2]
         ic_sub_padded   [i, :n] = all_is_cutting[i][::sf]
 
-    # Si le modèle prédit q_error (= q_real - q_des), reconstruire q_eff = q_des + delta
     target_keys = H.get("target_keys", ["q_real"])
     if isinstance(target_keys, str):
         target_keys = [k.strip() for k in target_keys.split(",")]
@@ -190,18 +189,18 @@ def load_model_records(data_dir: str, piece_db: list, model_path: str,
 
     q_pred_joints = q_pred_all[:, :, :2]
     if predicts_error:
-        q_eff = q_des_sub_padded + q_pred_joints   # q_des + erreur simulée
+        q_eff = q_des_sub_padded + q_pred_joints
     else:
-        q_eff = q_pred_joints                      # q_real prédit directement
+        q_eff = q_pred_joints
 
-    fk_pred_all = fk_batch(q_eff.reshape(-1, 2)).reshape(N, max_sub, 2)
-    fk_des_all  = fk_batch(q_des_sub_padded.reshape(-1, 2)).reshape(N, max_sub, 2)
-    deviation_all = np.linalg.norm(fk_pred_all - fk_des_all, axis=2)   # (N, max_sub)
+    fk_pred_all   = fk_batch(q_eff.reshape(-1, 2)).reshape(N, max_sub, 2)
+    fk_des_all    = fk_batch(q_des_sub_padded.reshape(-1, 2)).reshape(N, max_sub, 2)
+    deviation_all = np.linalg.norm(fk_pred_all - fk_des_all, axis=2)
 
     records = []
     for i in range(N):
-        n    = ep_n_sub[i]
-        mask = ic_sub_padded[i, :n] == 1.0
+        n     = ep_n_sub[i]
+        mask  = ic_sub_padded[i, :n] == 1.0
         n_cut = mask.sum()
         if n_cut == 0:
             defect_pct = 0.0

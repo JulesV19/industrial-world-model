@@ -351,10 +351,16 @@ def _parse_args():
     p = argparse.ArgumentParser()
     for k, v in DEFAULTS.items():
         p.add_argument(f"--{k}", type=str if k == "target_keys" else type(v), default=v)
-    # Argument supprimé — accepté silencieusement pour compatibilité avec les anciennes commandes
+    # Arguments supprimés — acceptés silencieusement pour compatibilité avec les anciennes commandes
     p.add_argument("--error_weight_gamma", type=float, default=None)
+    p.add_argument("--ss_start_epoch",     type=int,   default=None)
+    p.add_argument("--ss_end_epoch",       type=int,   default=None)
+    p.add_argument("--ss_p_min",           type=float, default=None)
     args = vars(p.parse_args())
     args.pop("error_weight_gamma", None)
+    args.pop("ss_start_epoch",     None)
+    args.pop("ss_end_epoch",       None)
+    args.pop("ss_p_min",           None)
     return args
 
 
