@@ -390,7 +390,11 @@ def _parse_args():
     p = argparse.ArgumentParser()
     for k, v in DEFAULTS.items():
         p.add_argument(f"--{k}", type=str if k == "target_keys" else type(v), default=v)
-    return vars(p.parse_args())
+    # Argument supprimé — accepté silencieusement pour compatibilité avec les anciennes commandes
+    p.add_argument("--error_weight_gamma", type=float, default=None)
+    args = vars(p.parse_args())
+    args.pop("error_weight_gamma", None)
+    return args
 
 
 if __name__ == "__main__":

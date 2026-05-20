@@ -205,8 +205,8 @@ class TemporalDecoder(nn.Module):
                                    targets[t_idx, :-1, :]], dim=1)
             x = torch.cat([ctx[t_idx], pe[t_idx], q_shifted], dim=-1).contiguous()
             h_raw, _ = self.gru(x, h0[:, t_idx, :].contiguous())
-            h_states[t_idx] = h_raw
-            traj[t_idx]     = self.dec_out(self.dec_res(self.dec_in(h_raw)))
+            h_states[t_idx] = h_raw.to(dtype)
+            traj[t_idx]     = self.dec_out(self.dec_res(self.dec_in(h_raw))).to(dtype)
 
         # — sous-batch free-running : boucle step-by-step —
         if f_idx.numel() > 0:
@@ -225,8 +225,8 @@ class TemporalDecoder(nn.Module):
                 pred_t = self.dec_out(self.dec_res(self.dec_in(h_t_sq)))
                 traj_buf.append(pred_t)
                 qp_f = pred_t.detach()
-            traj[f_idx]     = torch.stack(traj_buf, dim=1)
-            h_states[f_idx] = torch.stack(h_buf,    dim=1)
+            traj[f_idx]     = torch.stack(traj_buf, dim=1).to(dtype)
+            h_states[f_idx] = torch.stack(h_buf,    dim=1).to(dtype)
 
         quality = self.quality_head(h_states)
         return traj, quality
