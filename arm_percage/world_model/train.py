@@ -20,21 +20,26 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from .dataset import DrillDataset
-from .model import DrillModel
+from .dataset import DrillDataset, collate_fn
+from .model import DrillWorldModel
 
 
 DEFAULTS = dict(
     corner_embed_dim = 64,
-    global_dim       = 256,
+    embed_dim        = 256,
+    h_dim            = 512,
+    pe_dim           = 64,
+    gru_layers       = 2,
+    n_attn_heads     = 4,
     dropout          = 0.1,
     lr               = 3e-4,
     weight_decay     = 1e-4,
-    batch_size       = 64,
+    batch_size       = 32,
     epochs           = 150,
     grad_clip        = 5.0,
     val_split        = 0.1,
     seed             = 42,
+    lambda_traj      = 1.0,   # poids de la loss trajectoire
     lambda_defect    = 0.5,   # poids de la loss BCE défaut
     early_stopping   = 40,
     save_dir         = "world_model/checkpoints",
@@ -43,7 +48,7 @@ DEFAULTS = dict(
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():    return torch.device("cuda")
+    if torch.cuda.is_available():         return torch.device("cuda")
     if torch.backends.mps.is_available(): return torch.device("mps")
     return torch.device("cpu")
 
@@ -51,6 +56,16 @@ def get_device() -> torch.device:
 def _fmt_time(s: float) -> str:
     s = int(s); h, r = divmod(s, 3600); m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _traj_loss(pred: torch.Tensor, target: torch.Tensor,
+               lengths: torch.Tensor) -> torch.Tensor:
+    """MSE sur les pas valides seulement."""
+    T   = pred.shape[1]
+    idx = torch.arange(T, device=pred.device).unsqueeze(0)   # (1, T)
+    mask = idx < lengths.unsqueeze(1)                         # (B, T)
+    mask = mask.unsqueeze(-1).expand_as(pred)                 # (B, T, 2)
+    return F.mse_loss(pred[mask], target[mask])
 
 
 def train(cfg: dict | None = None):
@@ -65,6 +80,7 @@ def train(cfg: dict | None = None):
 
     full_ds = DrillDataset(episode_paths)
     full_ds.normalizer.save(os.path.join(H["save_dir"], "normalizer.npz"))
+    full_ds.traj_normalizer.save(os.path.join(H["save_dir"], "traj_normalizer.npz"))
 
     n_val   = max(1, int(len(full_ds) * H["val_split"]))
     n_train = len(full_ds) - n_val
@@ -73,14 +89,18 @@ def train(cfg: dict | None = None):
 
     pin = device.type == "cuda"
     train_loader = DataLoader(train_ds, batch_size=H["batch_size"],
-                              shuffle=True, pin_memory=pin)
+                              shuffle=True,  pin_memory=pin, collate_fn=collate_fn)
     val_loader   = DataLoader(val_ds,   batch_size=H["batch_size"],
-                              shuffle=False, pin_memory=pin)
+                              shuffle=False, pin_memory=pin, collate_fn=collate_fn)
     print(f"Train : {n_train}  |  Val : {n_val}")
 
-    model = DrillModel(
+    model = DrillWorldModel(
         corner_embed_dim = H["corner_embed_dim"],
-        global_dim       = H["global_dim"],
+        embed_dim        = H["embed_dim"],
+        h_dim            = H["h_dim"],
+        pe_dim           = H["pe_dim"],
+        gru_layers       = H["gru_layers"],
+        n_attn_heads     = H["n_attn_heads"],
         dropout          = H["dropout"],
     ).to(device)
     print(f"Paramètres : {sum(p.numel() for p in model.parameters()):,}")
@@ -105,20 +125,26 @@ def train(cfg: dict | None = None):
         train_total = 0.0
         total_gnorm = 0.0
 
-        for corners, speed, offsets_target, defects_target in train_loader:
-            corners        = corners.to(device)          # (B, 4, 2)
-            speed          = speed.unsqueeze(-1).to(device)  # (B, 1)
-            offsets_target = offsets_target.to(device)   # (B, 4, 2)
-            defects_target = defects_target.to(device)   # (B, 4)
+        for corners, speed, traj_target, lengths, offsets_target, defects_target in train_loader:
+            corners        = corners.to(device)                  # (B, 4, 2)
+            speed          = speed.unsqueeze(-1).to(device)      # (B, 1)
+            traj_target    = traj_target.to(device)              # (B, T_max, 2)
+            lengths        = lengths.to(device)                  # (B,)
+            offsets_target = offsets_target.to(device)           # (B, 4, 2)
+            defects_target = defects_target.to(device)           # (B, 4)
 
+            T = traj_target.shape[1]
             optimizer.zero_grad()
-            offsets_pred, defect_logits = model(corners, speed)
+            traj_pred, offsets_pred, defect_logits = model(corners, speed, T, lengths)
 
+            loss_traj   = _traj_loss(traj_pred, traj_target, lengths)
             loss_offset = F.mse_loss(offsets_pred, offsets_target)
             loss_defect = F.binary_cross_entropy_with_logits(
                 defect_logits, defects_target
             )
-            loss = loss_offset + H["lambda_defect"] * loss_defect
+            loss = (H["lambda_traj"]   * loss_traj
+                    +                    loss_offset
+                    + H["lambda_defect"] * loss_defect)
 
             loss.backward()
             gnorm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
@@ -134,20 +160,26 @@ def train(cfg: dict | None = None):
         model.eval()
         val_total = 0.0
         with torch.no_grad():
-            for corners, speed, offsets_target, defects_target in val_loader:
+            for corners, speed, traj_target, lengths, offsets_target, defects_target in val_loader:
                 corners        = corners.to(device)
                 speed          = speed.unsqueeze(-1).to(device)
+                traj_target    = traj_target.to(device)
+                lengths        = lengths.to(device)
                 offsets_target = offsets_target.to(device)
                 defects_target = defects_target.to(device)
-                offsets_pred, defect_logits = model(corners, speed)
-                loss = F.mse_loss(offsets_pred, offsets_target) + \
-                       H["lambda_defect"] * F.binary_cross_entropy_with_logits(
-                           defect_logits, defects_target)
+
+                T = traj_target.shape[1]
+                traj_pred, offsets_pred, defect_logits = model(corners, speed, T, lengths)
+
+                loss = (H["lambda_traj"]   * _traj_loss(traj_pred, traj_target, lengths)
+                        +                    F.mse_loss(offsets_pred, offsets_target)
+                        + H["lambda_defect"] * F.binary_cross_entropy_with_logits(
+                            defect_logits, defects_target))
                 val_total += loss.item()
 
-        avg_train = train_total / len(train_loader)
-        avg_val   = val_total   / len(val_loader)
-        avg_gnorm = total_gnorm / len(train_loader)
+        avg_train  = train_total / len(train_loader)
+        avg_val    = val_total   / len(val_loader)
+        avg_gnorm  = total_gnorm / len(train_loader)
         epoch_time = time.time() - t_ep
         elapsed    = time.time() - t_start
         eta        = elapsed / epoch * (H["epochs"] - epoch)
@@ -162,12 +194,14 @@ def train(cfg: dict | None = None):
             best_val = avg_val
             epochs_no_imp = 0
             torch.save({
-                "epoch":       epoch,
-                "model_state": model.state_dict(),
-                "hyperparams": H,
-                "val_loss":    avg_val,
-                "norm_mean":   full_ds.normalizer.mean,
-                "norm_std":    full_ds.normalizer.std,
+                "epoch":            epoch,
+                "model_state":      model.state_dict(),
+                "hyperparams":      H,
+                "val_loss":         avg_val,
+                "norm_mean":        full_ds.normalizer.mean,
+                "norm_std":         full_ds.normalizer.std,
+                "traj_norm_mean":   full_ds.traj_normalizer.mean,
+                "traj_norm_std":    full_ds.traj_normalizer.std,
             }, os.path.join(H["save_dir"], "best_model.pt"))
         else:
             epochs_no_imp += 1
@@ -187,7 +221,7 @@ def train(cfg: dict | None = None):
 
     print(f"\nDone in {_fmt_time(time.time() - t_start)}.  Best val : {best_val:.4f}")
     _save_curves(history, H["save_dir"])
-    return model, full_ds.normalizer, H
+    return model, full_ds.normalizer, full_ds.traj_normalizer, H
 
 
 def _save_curves(history: dict, save_dir: str):
