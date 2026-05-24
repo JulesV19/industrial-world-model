@@ -4,3 +4,4 @@ world_model/checkpoints/
 .DS_Store
 dataset/
 pieces_database.json
+.venv

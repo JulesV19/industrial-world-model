@@ -2,3 +2,4 @@ torch>=2.0.0
 numpy
 matplotlib
 tqdm
+pygame>=2.1.0

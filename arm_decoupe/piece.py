@@ -49,18 +49,18 @@ def _circle(s, n_pts=48):
              r * math.sin(i * 2*math.pi / n_pts)) for i in range(n_pts)]
 
 
-def _trapezoid(s):
-    w_bot = s * random.uniform(0.7, 1.0)
-    w_top = w_bot * random.uniform(0.3, 0.7)   # trapèze isocèle symétrique
-    h = s * random.uniform(0.4, 0.8)
-    return [(-w_bot/2, -h/2), (w_bot/2, -h/2),
-            (w_top/2,   h/2), (-w_top/2,  h/2)]
+def _triangle(s):
+    r = s / math.sqrt(3)   # rayon du cercle circonscrit d'un triangle équilatéral de côté s
+    pts = [(r * math.cos(math.pi/2 + i * 2*math.pi/3),
+            r * math.sin(math.pi/2 + i * 2*math.pi/3)) for i in range(3)]
+    angle = random.uniform(0, 2 * math.pi)
+    return _rotate(pts, angle)
 
 
 _SHAPES = [
-    ("SQUARE",    _square),
-    ("CIRCLE",    _circle),
-    ("TRAPEZOID", _trapezoid),
+    ("SQUARE",   _square),
+    ("CIRCLE",   _circle),
+    ("TRIANGLE", _triangle),
 ]
 _SHAPE_NAMES = [n for n, _ in _SHAPES]
 _SHAPE_FNS   = {n: fn for n, fn in _SHAPES}
@@ -73,7 +73,7 @@ def generate_shape_database(num_shapes=100):
         base_x, base_y = 1.0, 1.0
         scale = random.uniform(1.2, 1.6)
 
-        shape_type = "SQUARE"
+        shape_type = random.choice(_SHAPE_NAMES)
         pts = _SHAPE_FNS[shape_type](scale)
 
         pts = _clamp_to_workspace(pts, base_x, base_y)
