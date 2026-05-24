@@ -59,8 +59,8 @@ def _triangle(s):
 
 _SHAPES = [
     ("SQUARE",   _square),
-    ("CIRCLE",   _circle),
-    ("TRIANGLE", _triangle),
+    #("CIRCLE",   _circle),
+    #("TRIANGLE", _triangle),
 ]
 _SHAPE_NAMES = [n for n, _ in _SHAPES]
 _SHAPE_FNS   = {n: fn for n, fn in _SHAPES}
