@@ -5,3 +5,4 @@ world_model/checkpoints/
 dataset/
 pieces_database.json
 .venv
+dataset.tararm_decoupe/dataset.tar

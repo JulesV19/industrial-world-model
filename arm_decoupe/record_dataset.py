@@ -244,10 +244,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["single", "session"], default="single",
                         help="single : comportement d'origine | session : sessions avec dégradation")
-    parser.add_argument("--n-sessions",  type=int, default=N_SESSIONS)
-    parser.add_argument("--n-pieces",    type=int, default=N_PIECES_PER_SESSION)
-    parser.add_argument("--out",         type=str, default="dataset")
-    parser.add_argument("--seed",        type=int, default=0)
+    parser.add_argument("--n-sessions",  type=int,   default=N_SESSIONS)
+    parser.add_argument("--n-pieces",    type=int,   default=N_PIECES_PER_SESSION)
+    parser.add_argument("--speed-min",   type=float, default=None)
+    parser.add_argument("--speed-max",   type=float, default=None)
+    parser.add_argument("--out",         type=str,   default="dataset")
+    parser.add_argument("--seed",        type=int,   default=0)
     args = parser.parse_args()
 
     try:
@@ -256,6 +258,11 @@ def main():
         print("Erreur : 'pieces_database.json' introuvable.")
         print("Lancez d'abord 'python3 generate_pieces.py'.")
         sys.exit(1)
+
+    if args.speed_min is not None:
+        data["speed_min"] = args.speed_min
+    if args.speed_max is not None:
+        data["speed_max"] = args.speed_max
 
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(args.seed)
