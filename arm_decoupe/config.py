@@ -42,7 +42,7 @@ alpha_filter = 0.15
 
 # --- DEGRADATION TEMPORELLE (usure mecanique via piece_count) ---
 FRICTION_DEGRAD_ALPHA    = 1
-FRICTION_DEGRAD_HALFLIFE = 1500
+FRICTION_DEGRAD_HALFLIFE = 300
 TEMP_NOISE_GAMMA         = 0.2
 CADENCE_REF              = 60.0
 

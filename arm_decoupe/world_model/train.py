@@ -279,8 +279,7 @@ def train(cfg: dict | None = None):
         history["lr"       ].append(current_lr)
         history["grad_norm"].append(avg_grad_norm)
 
-
-
+        rollout_mse = None
         improved = avg_val < best_val
         if improved:
             best_val      = avg_val
@@ -320,7 +319,7 @@ def train(cfg: dict | None = None):
     total_time = time.time() - t_start
     print(f"\nDone in {_fmt_time(total_time)}.  Best val loss : {best_val:.4f}")
     _save_curves(history, H["save_dir"])
-    return model, full_ds.normalizer, H
+    return model, train_ds.normalizer, H
 
 
 # ── plot helpers ───────────────────────────────────────────────────────────────
