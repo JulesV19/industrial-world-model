@@ -51,6 +51,7 @@ DEFAULTS = dict(
     target_keys          = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
     lambda_dev           = 1.0,      # poids de la loss cut_deviation (MSE, espace normalisé)
     lambda_defect        = 0.5,      # poids de la loss cut_defect (BCE)
+    lambda_vel           = 0.5,      # poids de la loss sur les différences temporelles (d(q)/dt)
     rollout_eval_every   = 10,       # évaluer le rollout autorégressif toutes les N epochs (0 = jamais)
     n_rollout_sessions   = 5,        # nombre de sessions de val utilisées pour le rollout
     save_dir             = "world_model/checkpoints",
@@ -312,6 +313,12 @@ def train(cfg: dict | None = None):
                     quality, cut_dev, cut_defect, is_cutting, seq_len,
                     H["lambda_dev"], H["lambda_defect"],
                 )
+                if H["lambda_vel"] > 0:
+                    vel_pred = preds[:, 1:] - preds[:, :-1]
+                    vel_true = obs[:, 1:]   - obs[:, :-1]
+                    loss = loss + H["lambda_vel"] * compute_loss(
+                        vel_pred, vel_true, (seq_len - 1).clamp(min=0)
+                    )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
@@ -357,6 +364,12 @@ def train(cfg: dict | None = None):
                         quality, cut_dev, cut_defect, is_cutting, seq_len,
                         H["lambda_dev"], H["lambda_defect"],
                     )
+                    if H["lambda_vel"] > 0:
+                        vel_pred = preds[:, 1:] - preds[:, :-1]
+                        vel_true = obs[:, 1:]   - obs[:, :-1]
+                        val_loss = val_loss + H["lambda_vel"] * compute_loss(
+                            vel_pred, vel_true, (seq_len - 1).clamp(min=0)
+                        )
                     val_total += val_loss.item()
 
         avg_train     = train_total     / len(train_loader)
