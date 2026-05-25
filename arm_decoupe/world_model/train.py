@@ -260,7 +260,7 @@ def train(cfg: dict | None = None):
 
     # Mixed precision
     use_amp = H["use_amp"] and device.type == "cuda"
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
     amp_dtype = torch.bfloat16   # BF16 : pas de perte de dynamique sur A100/T4
     print(f"Mixed precision BF16 : {'ON' if use_amp else 'OFF'}")
 
