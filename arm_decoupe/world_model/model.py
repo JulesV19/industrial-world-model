@@ -185,7 +185,13 @@ class TemporalDecoder(nn.Module):
         h0  = self.h_init(shape_embed) \
                   .view(B, self.gru_layers, self.h_dim) \
                   .permute(1, 0, 2).contiguous()         # (L, B, h_dim)
-        pe  = self.pe(T).unsqueeze(0).expand(B, T, -1)  # (B, T, pe_dim)
+
+        # PE normalisé : indices ramenés à [0, max_len-1] quelle que soit la longueur T.
+        # Sans ça, pe(t) a une signification différente selon T → décalage temporel variable.
+        max_len = self.pe.pe.shape[0]
+        t_norm  = torch.linspace(0, max_len - 1, T, device=shape_embed.device).long()
+        pe      = self.pe.pe[t_norm].unsqueeze(0).expand(B, T, -1)  # (B, T, pe_dim)
+
         ctx = shape_embed.unsqueeze(1).expand(B, T, E)  # (B, T, E)
 
         x       = torch.cat([ctx, pe], dim=-1).contiguous()
