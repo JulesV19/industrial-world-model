@@ -3,6 +3,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+HISTORY_K       = 100   # nombre de pièces précédentes dans l'historique
+PIECE_COUNT_NORM = 1000.0
+CADENCE_NORM     = 60.0
+DEVIATION_NORM   = 0.02  # seuil de défaut — normalise l'historique de déviations
+
+
+# ── History Encoder ────────────────────────────────────────────────────────────
+class HistoryEncoder(nn.Module):
+    """GRU sur K déviations passées (normalisées) → embedding 64D."""
+
+    def __init__(self, K: int = HISTORY_K, hidden: int = 64):
+        super().__init__()
+        self.gru = nn.GRU(1, hidden, batch_first=True)
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        # history : (B, K, 1) — déviations normalisées
+        _, h = self.gru(history)
+        return h.squeeze(0)   # (B, 64)
+
+
+# ── Context Encoder ────────────────────────────────────────────────────────────
+class ContextEncoder(nn.Module):
+    """(piece_count_norm, cadence_norm) → 64D."""
+
+    def __init__(self, out_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 64), nn.GELU(), nn.Linear(64, out_dim)
+        )
+
+    def forward(self, piece_count: torch.Tensor, cadence: torch.Tensor) -> torch.Tensor:
+        # piece_count, cadence : (B, 1) chacun, déjà normalisés
+        return self.net(torch.cat([piece_count, cadence], dim=-1))  # (B, 64)
+
 
 # ── Shape Encoder ──────────────────────────────────────────────────────────────
 class ShapeEncoder(nn.Module):
@@ -186,13 +220,22 @@ class WorldModel(nn.Module):
         free_bits:       float = 0.5,   # idem
         gru_layers:      int   = 3,
         pe_dim:          int   = 64,
+        history_hidden:  int   = 64,
+        context_dim:     int   = 64,
     ):
         super().__init__()
-        self.encoder    = ShapeEncoder(embed_dim=shape_embed_dim, dropout=dropout)
-        self.speed_proj = nn.Sequential(
+        self.encoder         = ShapeEncoder(embed_dim=shape_embed_dim, dropout=dropout)
+        self.speed_proj      = nn.Sequential(
             nn.Linear(1, shape_embed_dim),
             nn.GELU(),
             nn.Linear(shape_embed_dim, shape_embed_dim),
+        )
+        self.history_encoder = HistoryEncoder(K=HISTORY_K, hidden=history_hidden)
+        self.context_encoder = ContextEncoder(out_dim=context_dim)
+        # Projette [shape_embed(256) + hist(64) + ctx(64)] → 256
+        self.context_proj    = nn.Sequential(
+            nn.Linear(shape_embed_dim + history_hidden + context_dim, shape_embed_dim),
+            nn.GELU(),
         )
         self.decoder = TemporalDecoder(
             shape_embed_dim=shape_embed_dim,
@@ -200,17 +243,55 @@ class WorldModel(nn.Module):
             pe_dim=pe_dim, gru_layers=gru_layers, dropout=dropout,
         )
 
-    def forward(self, waypoints, wp_lengths, speed, targets=None, max_len=1300,
-                p_teacher=1.0, q_init=None):
-        """speed : (B, 1) float — duration_per_segment en secondes"""
-        shape_embed = self.encoder(waypoints, wp_lengths)
-        shape_embed = shape_embed + self.speed_proj(speed)
-        T = targets.shape[1] if targets is not None else max_len
-        return self.decoder(shape_embed, T, targets=targets)
+    def _encode(self, waypoints, wp_lengths, speed, deviation_history, piece_count, cadence):
+        """Fusionne les trois sources d'information → embedding 256D."""
+        shape_embed = self.encoder(waypoints, wp_lengths) + self.speed_proj(speed)
+
+        # Normalisation des inputs temporels
+        hist_norm = deviation_history / DEVIATION_NORM          # (B, K, 1)
+        pc_norm   = piece_count / PIECE_COUNT_NORM              # (B, 1)
+        cad_norm  = cadence     / CADENCE_NORM                  # (B, 1)
+
+        hist_embed = self.history_encoder(hist_norm)            # (B, 64)
+        ctx_embed  = self.context_encoder(pc_norm, cad_norm)    # (B, 64)
+
+        combined = torch.cat([shape_embed, hist_embed, ctx_embed], dim=-1)
+        return self.context_proj(combined)                      # (B, 256)
+
+    def forward(self, waypoints, wp_lengths, speed,
+                deviation_history=None, piece_count=None, cadence=None,
+                targets=None, max_len=1300, p_teacher=1.0, q_init=None):
+        """
+        deviation_history : (B, K, 1) — déviations des K pièces précédentes (en mètres).
+                            Si None, remplacé par des zéros (machine à neuf / mode single).
+        piece_count       : (B, 1) — nombre de pièces produites avant cette pièce.
+        cadence           : (B, 1) — pièces/heure.
+        speed             : (B, 1) — duration_per_segment en secondes.
+        """
+        B = waypoints.shape[0]
+        dev = _default_zeros(deviation_history, (B, HISTORY_K, 1), waypoints.device)
+        pc  = _default_zeros(piece_count,       (B, 1),            waypoints.device)
+        cad = _default_zeros(cadence,           (B, 1),            waypoints.device)
+
+        embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad)
+        T     = targets.shape[1] if targets is not None else max_len
+        return self.decoder(embed, T, targets=targets)
 
     @torch.no_grad()
-    def predict(self, waypoints, wp_lengths, speed, max_len=1300, q_init=None):
+    def predict(self, waypoints, wp_lengths, speed,
+                deviation_history=None, piece_count=None, cadence=None,
+                max_len=1300, q_init=None):
         self.eval()
-        shape_embed = self.encoder(waypoints, wp_lengths)
-        shape_embed = shape_embed + self.speed_proj(speed)
-        return self.decoder(shape_embed, max_len)
+        B = waypoints.shape[0]
+        dev = _default_zeros(deviation_history, (B, HISTORY_K, 1), waypoints.device)
+        pc  = _default_zeros(piece_count,       (B, 1),            waypoints.device)
+        cad = _default_zeros(cadence,           (B, 1),            waypoints.device)
+        embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad)
+        return self.decoder(embed, max_len)
+
+
+def _default_zeros(tensor, shape, device):
+    """Retourne tensor s'il est fourni, sinon un tenseur de zéros."""
+    if tensor is not None:
+        return tensor
+    return torch.zeros(shape, dtype=torch.float32, device=device)

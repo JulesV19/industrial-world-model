@@ -10,6 +10,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import time
 
@@ -19,10 +20,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .dataset import TrajectoryDataset, collate_fn, target_dim
+from .dataset import (TrajectoryDataset, collate_fn, target_dim,
+                      split_by_session, _load_episode, _is_session_file,
+                      _session_id, HISTORY_K)
 from .model import WorldModel
 
 
@@ -48,6 +51,8 @@ DEFAULTS = dict(
     target_keys          = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
     lambda_dev           = 1.0,      # poids de la loss cut_deviation (MSE, espace normalisé)
     lambda_defect        = 0.5,      # poids de la loss cut_defect (BCE)
+    rollout_eval_every   = 10,       # évaluer le rollout autorégressif toutes les N epochs (0 = jamais)
+    n_rollout_sessions   = 5,        # nombre de sessions de val utilisées pour le rollout
     save_dir             = "world_model/checkpoints",
     data_dir             = "dataset",
     db_path              = "pieces_database.json",
@@ -106,6 +111,79 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+# ── rollout autorégressif ──────────────────────────────────────────────────────
+
+def eval_rollout(model, val_paths, piece_db, target_keys,
+                 normalizer, dev_mean, dev_std, device, n_sessions=5):
+    """
+    Évalue le modèle en déroulement autorégressif sur n_sessions sessions de val.
+
+    À chaque pièce, l'historique est construit depuis les déviations que le modèle
+    a lui-même prédites (pas les vraies valeurs) — ce qui simule l'usage réel où
+    on prédit une session complète sans observer le comportement réel entre les pièces.
+
+    Retourne le MSE moyen (en m²) entre la courbe de déviation prédite et la courbe réelle.
+    """
+    # Grouper les chemins de val par session
+    sessions: dict[str, list[str]] = {}
+    for p in val_paths:
+        if _is_session_file(p):
+            sessions.setdefault(_session_id(p), []).append(p)
+
+    if not sessions:
+        return None
+
+    eval_sids = sorted(sessions.keys())[:n_sessions]
+    all_session_mse = []
+
+    model.eval()
+    with torch.no_grad():
+        for sid in eval_sids:
+            # Trier les pièces par numéro croissant
+            paths = sorted(
+                sessions[sid],
+                key=lambda p: int(re.search(r"piece(\d+)", p).group(1))
+            )
+            pred_devs: list[float] = []   # déviations prédites (en mètres)
+            true_devs: list[float] = []
+
+            for i, path in enumerate(paths):
+                ep = _load_episode(path, piece_db, target_keys)
+
+                # Historique depuis les prédictions passées (pas les vraies valeurs)
+                hist_raw = pred_devs[max(0, i - HISTORY_K):i]
+                pad      = [0.0] * (HISTORY_K - len(hist_raw))
+                hist     = np.array(pad + hist_raw, dtype=np.float32)
+
+                wps    = torch.from_numpy(ep["waypoints"]).unsqueeze(0).to(device)
+                wp_len = torch.tensor([ep["waypoints"].shape[0]]).to(device)
+                speed  = torch.tensor([[ep["speed"]]]).to(device)
+                dev_h  = torch.from_numpy(hist).view(1, HISTORY_K, 1).to(device)
+                pc     = torch.tensor([[float(ep["piece_count"])]]).to(device)
+                cad    = torch.tensor([[float(ep["cadence"])]]).to(device)
+
+                _, quality = model(wps, wp_len, speed,
+                                   deviation_history=dev_h,
+                                   piece_count=pc,
+                                   cadence=cad,
+                                   max_len=ep["length"])
+
+                # Déviation prédite : moyenne quality[:, :, 0] sur les pas en découpe
+                is_cut = torch.from_numpy(ep["is_cutting"]).to(device).bool()
+                T_ep   = min(quality.shape[1], len(is_cut))
+                q_cut  = quality[0, :T_ep, 0][is_cut[:T_ep]]
+                pred_dev = float(q_cut.mean()) * dev_std + dev_mean if q_cut.numel() > 0 else 0.0
+                pred_dev = max(0.0, pred_dev)
+
+                pred_devs.append(pred_dev)
+                true_devs.append(ep["mean_cut_deviation"])
+
+            mse = float(np.mean((np.array(pred_devs) - np.array(true_devs)) ** 2))
+            all_session_mse.append(mse)
+
+    return float(np.mean(all_session_mse)) if all_session_mse else None
+
+
 # ── training loop ──────────────────────────────────────────────────────────────
 def train(cfg: dict | None = None):
     H = {**DEFAULTS, **(cfg or {})}
@@ -118,7 +196,10 @@ def train(cfg: dict | None = None):
         db_json  = json.load(f)
     piece_db = db_json["pieces"]
 
-    episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
+    episode_paths = sorted(
+        glob.glob(os.path.join(H["data_dir"], "episode_*.npz")) +
+        glob.glob(os.path.join(H["data_dir"], "session_*_piece*.npz"))
+    )
     print(f"Episodes : {len(episode_paths)}")
 
     os.makedirs(H["save_dir"], exist_ok=True)
@@ -131,13 +212,12 @@ def train(cfg: dict | None = None):
     H["target_keys"] = target_keys
     print(f"Signaux cibles : {target_keys}  →  obs_dim={obs_dim}")
 
-    full_ds = TrajectoryDataset(episode_paths, piece_db, target_keys=target_keys)
-    full_ds.normalizer.save(os.path.join(H["save_dir"], "normalizer.npz"))
-
-    n_val   = max(1, int(len(full_ds) * H["val_split"]))
-    n_train = len(full_ds) - n_val
-    g       = torch.Generator().manual_seed(H["seed"])
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=g)
+    # Split par session complète pour éviter la fuite d'information via les historiques
+    train_paths, val_paths = split_by_session(episode_paths, H["val_split"], H["seed"])
+    train_ds = TrajectoryDataset(train_paths, piece_db or None, target_keys=target_keys)
+    val_ds   = TrajectoryDataset(val_paths,   piece_db or None,
+                                 normalizer=train_ds.normalizer, target_keys=target_keys)
+    train_ds.normalizer.save(os.path.join(H["save_dir"], "normalizer.npz"))
 
     nw  = H["num_workers"]
     pin = device.type == "cuda"   # pin_memory utile même avec num_workers=0 sur CUDA
@@ -151,7 +231,9 @@ def train(cfg: dict | None = None):
         shuffle=False, collate_fn=collate_fn,
         num_workers=nw, pin_memory=pin,
     )
-    print(f"Train : {n_train}  |  Val : {n_val}")
+    print(f"Train : {len(train_ds)}  |  Val : {len(val_ds)}"
+          f"  ({len({_session_id(p) for p in train_paths if _is_session_file(p)})} sess train"
+          f" / {len({_session_id(p) for p in val_paths if _is_session_file(p)})} sess val)")
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = WorldModel(
@@ -172,7 +254,7 @@ def train(cfg: dict | None = None):
     scheduler = CosineAnnealingLR(optimizer, T_max=H["epochs"], eta_min=1e-5)
 
     best_val      = float("inf")
-    history       = dict(train=[], val=[], lr=[], grad_norm=[])
+    history       = dict(train=[], val=[], lr=[], grad_norm=[], rollout=[])
     epochs_no_imp = 0
     t_start       = time.time()
 
@@ -198,13 +280,18 @@ def train(cfg: dict | None = None):
         train_total     = 0.0
         total_grad_norm = 0.0
 
-        for wps, wp_len, speed, obs, seq_len, cut_dev, cut_defect, is_cutting in train_loader:
+        for (wps, wp_len, speed, obs, seq_len,
+             cut_dev, cut_defect, is_cutting,
+             dev_hist, piece_count, cadence) in train_loader:
             wps, wp_len  = wps.to(device), wp_len.to(device)
             speed        = speed.to(device)
             obs, seq_len = obs.to(device), seq_len.to(device)
             cut_dev      = cut_dev.to(device)
             cut_defect   = cut_defect.to(device)
             is_cutting   = is_cutting.to(device)
+            dev_hist     = dev_hist.to(device)
+            piece_count  = piece_count.to(device)
+            cadence      = cadence.to(device)
 
             if sf > 1:
                 obs        = obs[:, ::sf, :].contiguous()
@@ -215,7 +302,11 @@ def train(cfg: dict | None = None):
 
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                preds, quality = model(wps, wp_len, speed, targets=obs)
+                preds, quality = model(wps, wp_len, speed,
+                                       deviation_history=dev_hist,
+                                       piece_count=piece_count,
+                                       cadence=cadence,
+                                       targets=obs)
                 loss = compute_loss(preds, obs, seq_len)
                 loss = loss + compute_quality_loss(
                     quality, cut_dev, cut_defect, is_cutting, seq_len,
@@ -237,13 +328,18 @@ def train(cfg: dict | None = None):
         model.eval()
         val_total = 0.0
         with torch.no_grad():
-            for wps, wp_len, speed, obs, seq_len, cut_dev, cut_defect, is_cutting in val_loader:
+            for (wps, wp_len, speed, obs, seq_len,
+                 cut_dev, cut_defect, is_cutting,
+                 dev_hist, piece_count, cadence) in val_loader:
                 wps, wp_len  = wps.to(device), wp_len.to(device)
                 speed        = speed.to(device)
                 obs, seq_len = obs.to(device), seq_len.to(device)
                 cut_dev      = cut_dev.to(device)
                 cut_defect   = cut_defect.to(device)
                 is_cutting   = is_cutting.to(device)
+                dev_hist     = dev_hist.to(device)
+                piece_count  = piece_count.to(device)
+                cadence      = cadence.to(device)
                 if sf > 1:
                     obs        = obs[:, ::sf, :].contiguous()
                     cut_dev    = cut_dev[:, ::sf].contiguous()
@@ -251,7 +347,11 @@ def train(cfg: dict | None = None):
                     is_cutting = is_cutting[:, ::sf].contiguous()
                     seq_len    = (seq_len + sf - 1) // sf
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    preds, quality = model(wps, wp_len, speed, targets=obs)
+                    preds, quality = model(wps, wp_len, speed,
+                                           deviation_history=dev_hist,
+                                           piece_count=piece_count,
+                                           cadence=cadence,
+                                           targets=obs)
                     val_loss = compute_loss(preds, obs, seq_len)
                     val_loss = val_loss + compute_quality_loss(
                         quality, cut_dev, cut_defect, is_cutting, seq_len,
@@ -271,6 +371,18 @@ def train(cfg: dict | None = None):
         history["lr"       ].append(current_lr)
         history["grad_norm"].append(avg_grad_norm)
 
+        # Rollout autorégressif (évaluation sur sessions complètes de val)
+        rollout_mse = None
+        every = H.get("rollout_eval_every", 10)
+        if every > 0 and epoch % every == 0:
+            rollout_mse = eval_rollout(
+                model, val_paths, piece_db, target_keys,
+                train_ds.normalizer, train_ds.dev_mean, train_ds.dev_std,
+                device, H.get("n_rollout_sessions", 5),
+            )
+            if rollout_mse is not None:
+                history["rollout"].append((epoch, rollout_mse))
+
         improved = avg_val < best_val
         if improved:
             best_val      = avg_val
@@ -281,14 +393,15 @@ def train(cfg: dict | None = None):
                     "model_state": model.state_dict(),
                     "hyperparams": H,
                     "val_loss": avg_val,
-                    "dev_mean": full_ds.dev_mean,
-                    "dev_std":  full_ds.dev_std,
+                    "dev_mean": train_ds.dev_mean,
+                    "dev_std":  train_ds.dev_std,
                 },
                 os.path.join(H["save_dir"], "best_model.pt"),
             )
         else:
             epochs_no_imp += 1
 
+        rollout_str = f"  rollout={rollout_mse*1e6:.1f}µm²" if rollout_mse is not None else ""
         marker = " ★" if improved else f" ({epochs_no_imp})"
         epoch_bar.set_postfix(
             val=f"{avg_val:.4f}", best=f"{best_val:.4f}",
@@ -297,7 +410,7 @@ def train(cfg: dict | None = None):
         tqdm.write(
             f"[{epoch:3d}/{H['epochs']}] {epoch_time:5.1f}s  ETA {_fmt_time(eta)}  "
             f"lr={current_lr:.2e}  ‖g‖={avg_grad_norm:.2f}  "
-            f"train={avg_train:.4f}  val={avg_val:.4f}{marker}"
+            f"train={avg_train:.4f}  val={avg_val:.4f}{rollout_str}{marker}"
         )
 
         # Early stopping
@@ -321,7 +434,9 @@ def _fmt_time(seconds: float) -> str:
 
 
 def _save_curves(history: dict, save_dir: str):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    has_rollout = bool(history.get("rollout"))
+    n_plots = 4 if has_rollout else 3
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4))
 
     ax = axes[0]
     ax.plot(history["train"], label="Train")
@@ -338,6 +453,13 @@ def _save_curves(history: dict, save_dir: str):
     ax.plot(history["grad_norm"])
     ax.set_title("Gradient norm (avg per epoch)"); ax.set_xlabel("Epoch")
     ax.grid(True, alpha=0.3)
+
+    if has_rollout:
+        ax = axes[3]
+        epochs_r, mses = zip(*history["rollout"])
+        ax.plot(epochs_r, [m * 1e6 for m in mses], marker='o', markersize=4)
+        ax.set_title("Rollout MSE (µm²) — autorégressif"); ax.set_xlabel("Epoch")
+        ax.set_yscale("log"); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     path = os.path.join(save_dir, "training_curves.png")

@@ -1,26 +1,31 @@
+import argparse
 import glob
 import os
 import sys
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 from arm import PhysicsArmEnv, RobotController, TrajectoryPlanner, inverse_kinematics
 from piece import load_shape_database
 from config import l1, l2
 
-# Seuil en mètres au-delà duquel un point de découpe est considéré comme défectueux.
-# À ajuster selon les résultats visuels.
 CUT_DEFECT_THRESHOLD = 0.02
+
+N_SESSIONS          = 200
+N_PIECES_PER_SESSION = 100
+CADENCE_MIN         = 20.0   # pièces/heure
+CADENCE_MAX         = 120.0  # pièces/heure
 
 
 def fk(q):
-    """Cinématique directe → position cartésienne de l'effecteur."""
     x = l1 * np.cos(q[0]) + l2 * np.cos(q[0] + q[1])
     y = l1 * np.sin(q[0]) + l2 * np.sin(q[0] + q[1])
     return np.array([x, y])
 
 
-def record_episode(waypoints, duration):
+def record_episode(waypoints: list, duration: float, machine_state=None):
     planner = TrajectoryPlanner(waypoints, duration_per_segment=duration)
-    env = PhysicsArmEnv(initial_q=planner.last_q)
+    env = PhysicsArmEnv(initial_q=planner.last_q, machine_state=machine_state)
     controller = RobotController()
 
     factory_state = "ARRIVING"
@@ -65,11 +70,7 @@ def record_episode(waypoints, duration):
         q_real = state[0:2]
         cutting = (factory_state == "CUTTING" and planner.is_cutting)
 
-        # Déviation cartésienne effecteur réel vs désiré (uniquement pendant la découpe)
-        if cutting:
-            cut_dev = float(np.linalg.norm(fk(q_real) - fk(q_des)))
-        else:
-            cut_dev = 0.0
+        cut_dev = float(np.linalg.norm(fk(q_real) - fk(q_des))) if cutting else 0.0
 
         step_count += 1
         if step_count % SUBSAMPLE == 0:
@@ -86,7 +87,11 @@ def record_episode(waypoints, duration):
     cut_deviation = np.array(log_cut_deviation, dtype=np.float32)
     cut_defect    = (cut_deviation > CUT_DEFECT_THRESHOLD).astype(np.float32)
 
-    return dict(
+    cutting_mask = np.array(log_is_cutting, dtype=bool)
+    cutting_devs = cut_deviation[cutting_mask]
+    mean_cut_deviation = float(cutting_devs.mean()) if cutting_devs.size > 0 else 0.0
+
+    result = dict(
         q_real        = np.array(log_q_real,    dtype=np.float32),
         dq_real       = np.array(log_dq_real,   dtype=np.float32),
         q_sensed      = np.array(log_q_sensed,  dtype=np.float32),
@@ -98,10 +103,153 @@ def record_episode(waypoints, duration):
         cut_deviation = cut_deviation,
         cut_defect    = cut_defect,
         duration_per_segment = np.float32(duration),
+        mean_cut_deviation   = np.float32(mean_cut_deviation),
+        piece_count   = np.int32(machine_state['piece_count'] if machine_state else 0),
+        cadence       = np.float32(machine_state['cadence']   if machine_state else 0.0),
+        waypoints     = np.array(waypoints,      dtype=np.float32),
     )
+    return result, mean_cut_deviation
+
+
+def _worker_single(args):
+    piece_idx, waypoints, run, duration = args
+    arrays, _ = record_episode(waypoints, duration)
+    return piece_idx, run, arrays, duration
+
+
+def _run_single_mode(data, rng, out_dir):
+    pieces    = data["pieces"]
+    n_runs    = data["n_runs"]
+    speed_min = data["speed_min"]
+    speed_max = data["speed_max"]
+
+    old = glob.glob(os.path.join(out_dir, "*.npz"))
+    if old:
+        for f in old:
+            os.remove(f)
+        print(f"  {len(old)} ancien(s) fichier(s) supprimé(s).")
+
+    # Pré-génération séquentielle des paramètres aléatoires (ordre identique à l'original)
+    jobs = []
+    for piece_idx, waypoints in enumerate(pieces):
+        for run in range(n_runs):
+            duration = float(rng.uniform(speed_min, speed_max))
+            jobs.append((piece_idx, waypoints, run, duration))
+
+    total = len(jobs)
+    print(f"Mode single : {len(pieces)} pièces × {n_runs} runs = {total} épisodes")
+    print(f"  Vitesse ∈ U[{speed_min}, {speed_max}] s/seg  |  Seuil défaut : {CUT_DEFECT_THRESHOLD} m")
+
+    results = {}
+    n_workers = max(1, (os.cpu_count() or 1) - 1)
+    total_defects = 0
+    total_cutting = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker_single, job): job for job in jobs}
+        with tqdm(total=total, unit="ep", desc="Simulation") as pbar:
+            for future in as_completed(futures):
+                piece_idx, run, arrays, duration = future.result()
+                results[(piece_idx, run)] = (arrays, duration)
+                n_cutting = int(arrays["is_cutting"].sum())
+                n_defects = int(arrays["cut_defect"].sum())
+                total_cutting += n_cutting
+                total_defects += n_defects
+                defect_pct = 100 * total_defects / total_cutting if total_cutting > 0 else 0.0
+                pbar.set_postfix(défauts=f"{defect_pct:.1f}%")
+                pbar.update(1)
+
+    # Écriture dans l'ordre original
+    with tqdm(total=total, unit="ep", desc="Écriture  ") as pbar:
+        for piece_idx, waypoints, run, duration in jobs:
+            arrays, _ = results[(piece_idx, run)]
+            filename = os.path.join(out_dir, f"episode_{piece_idx+1:03d}_run{run:02d}.npz")
+            np.savez_compressed(filename, **arrays)
+            pbar.update(1)
+
+
+def _worker_session(args):
+    sess, n, waypoints, duration, cadence = args
+    machine_state = {'piece_count': n, 'cadence': cadence}
+    arrays, mean_dev = record_episode(waypoints, duration, machine_state)
+    return sess, n, arrays, mean_dev, cadence, duration
+
+
+def _run_session_mode(data, rng, out_dir, n_sessions, n_pieces):
+    pieces    = data["pieces"]
+    speed_min = data["speed_min"]
+    speed_max = data["speed_max"]
+
+    old = glob.glob(os.path.join(out_dir, "*.npz")) + \
+          glob.glob(os.path.join(out_dir, "session_*_deviations.npy")) + \
+          glob.glob(os.path.join(out_dir, "session_*_cadence.npy"))
+    if old:
+        for f in old:
+            os.remove(f)
+        print(f"  {len(old)} ancien(s) fichier(s) supprimé(s).")
+
+    print(f"Mode session : {n_sessions} sessions × {n_pieces} pièces")
+    print(f"  Cadence ∈ U[{CADENCE_MIN}, {CADENCE_MAX}] pièces/h")
+    print(f"  Vitesse ∈ U[{speed_min}, {speed_max}] s/seg  |  Seuil défaut : {CUT_DEFECT_THRESHOLD} m")
+
+    # Pré-génération séquentielle des paramètres aléatoires (ordre identique à l'original)
+    jobs = []
+    session_meta = {}  # sess -> (cadence, duration)
+    for sess in range(n_sessions):
+        cadence  = float(rng.uniform(CADENCE_MIN, CADENCE_MAX))
+        duration = float(rng.uniform(speed_min, speed_max))
+        session_meta[sess] = (cadence, duration)
+        for n in range(n_pieces):
+            piece_idx = int(rng.integers(0, len(pieces)))
+            waypoints = pieces[piece_idx]
+            jobs.append((sess, n, waypoints, duration, cadence))
+
+    total = len(jobs)
+    results = {}
+    n_workers = max(1, (os.cpu_count() or 1) - 1)
+    total_defects = 0
+    total_cutting = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker_session, job): job for job in jobs}
+        with tqdm(total=total, unit="ep", desc="Simulation") as pbar:
+            for future in as_completed(futures):
+                sess, n, arrays, mean_dev, cadence, duration = future.result()
+                results[(sess, n)] = (arrays, mean_dev, cadence, duration)
+                n_cutting = int(arrays["is_cutting"].sum())
+                n_defects = int(arrays["cut_defect"].sum())
+                total_cutting += n_cutting
+                total_defects += n_defects
+                defect_pct = 100 * total_defects / total_cutting if total_cutting > 0 else 0.0
+                pbar.set_postfix(défauts=f"{defect_pct:.1f}%", dev=f"{mean_dev*1000:.2f}mm")
+                pbar.update(1)
+
+    # Écriture dans l'ordre original + reconstruction des deviations par session
+    with tqdm(total=total, unit="ep", desc="Écriture  ") as pbar:
+        for sess in range(n_sessions):
+            cadence, _ = session_meta[sess]
+            session_deviations = []
+            for n in range(n_pieces):
+                arrays, mean_dev, cadence, duration = results[(sess, n)]
+                session_deviations.append(mean_dev)
+                filename = os.path.join(out_dir, f"session_{sess:03d}_piece{n:04d}.npz")
+                np.savez_compressed(filename, **arrays)
+                pbar.update(1)
+
+            np.save(os.path.join(out_dir, f"session_{sess:03d}_deviations.npy"),
+                    np.array(session_deviations, dtype=np.float32))
+            np.save(os.path.join(out_dir, f"session_{sess:03d}_cadence.npy"),
+                    np.float32(cadence))
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["single", "session"], default="single",
+                        help="single : comportement d'origine | session : sessions avec dégradation")
+    parser.add_argument("--n-sessions",  type=int, default=N_SESSIONS)
+    parser.add_argument("--n-pieces",    type=int, default=N_PIECES_PER_SESSION)
+    parser.add_argument("--out",         type=str, default="dataset")
+    parser.add_argument("--seed",        type=int, default=0)
+    args = parser.parse_args()
+
     try:
         data = load_shape_database("pieces_database.json")
     except FileNotFoundError:
@@ -109,42 +257,15 @@ def main():
         print("Lancez d'abord 'python3 generate_pieces.py'.")
         sys.exit(1)
 
-    pieces    = data["pieces"]
-    n_runs    = data["n_runs"]
-    speed_min = data["speed_min"]
-    speed_max = data["speed_max"]
+    os.makedirs(args.out, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
 
-    os.makedirs("dataset", exist_ok=True)
-    old = glob.glob("dataset/*.npz")
-    if old:
-        for f in old:
-            os.remove(f)
-        print(f"  {len(old)} ancien(s) fichier(s) supprimé(s).")
+    if args.mode == "single":
+        _run_single_mode(data, rng, args.out)
+    else:
+        _run_session_mode(data, rng, args.out, args.n_sessions, args.n_pieces)
 
-    total = len(pieces) * n_runs
-    print(f"Enregistrement de {len(pieces)} pièces × {n_runs} runs = {total} épisodes...")
-    print(f"  Vitesse ∈ U[{speed_min}, {speed_max}] s/seg  |  Seuil défaut : {CUT_DEFECT_THRESHOLD} m")
-
-    rng = np.random.default_rng(seed=0)
-    idx = 0
-    for piece_idx, waypoints in enumerate(pieces):
-        for run in range(n_runs):
-            duration = float(rng.uniform(speed_min, speed_max))
-            idx += 1
-            arrays = record_episode(waypoints, duration)
-
-            filename = f"dataset/episode_{piece_idx+1:03d}_run{run:02d}.npz"
-            np.savez_compressed(filename, **arrays)
-
-            n_steps   = len(arrays["tau"])
-            n_cutting = int(arrays["is_cutting"].sum())
-            n_defects = int(arrays["cut_defect"].sum())
-            defect_pct = 100 * n_defects / n_cutting if n_cutting > 0 else 0.0
-            print(f"  [{idx:4d}/{total}] pièce {piece_idx+1:03d} run{run:02d} "
-                  f"spd={duration:.3f}s → {n_steps} steps, "
-                  f"défauts {n_defects}/{n_cutting} ({defect_pct:.1f}%)")
-
-    print("Dataset généré dans 'dataset/'.")
+    print(f"Dataset généré dans '{args.out}/'.")
 
 
 if __name__ == "__main__":
