@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import l1, l2
 from record_dataset import CUT_DEFECT_THRESHOLD
 from world_model.dataset import (
-    HISTORY_K, Normalizer, build_obs_vector, METRIC_KEYS,
+    HISTORY_K, HISTORY_DIM, Normalizer, build_obs_vector, METRIC_KEYS,
+    _load_session_history, _build_history,
 )
 from world_model.model import WorldModel
 from world_model.train import DEFAULTS, get_device
@@ -144,21 +145,10 @@ def _list_pieces(data_dir, sid):
     return indices
 
 
-def _build_history(session_devs, piece_count):
-    """Construit le vecteur d'historique (K,) depuis le tableau de déviations déjà chargé."""
-    if session_devs is None:
-        return np.zeros(HISTORY_K, dtype=np.float32)
-    n     = int(piece_count)
-    start = max(0, n - HISTORY_K)
-    hist  = session_devs[start:n]
-    pad   = np.zeros(HISTORY_K - len(hist), dtype=np.float32)
-    return np.concatenate([pad, hist]).astype(np.float32)
-
-
 def _load_session_devs(data_dir, sid):
-    """Charge le tableau de déviations d'une session (une seule fois)."""
-    p = os.path.join(data_dir, f"session_{sid}_deviations.npy")
-    return np.load(p).astype(np.float32) if os.path.exists(p) else None
+    """Charge la colonne déviation depuis session_history.npy (ou deviations.npy legacy)."""
+    hist = _load_session_history(data_dir, sid)
+    return hist[:, 0] if hist is not None else None
 
 
 # ── inférence batched ──────────────────────────────────────────────────────────
@@ -176,19 +166,19 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
     max_T = max(len(item[1]["q_real"])         for item in raw_batch)
 
     # Construire les tenseurs sur CPU avant le transfert groupé
-    wps_t   = torch.zeros(B, max_W, 3,        dtype=torch.float32)
-    wp_lens = torch.zeros(B,                   dtype=torch.long)
-    speeds  = torch.zeros(B, 1,                dtype=torch.float32)
-    hists   = torch.zeros(B, HISTORY_K, 1,    dtype=torch.float32)
-    pcs     = torch.zeros(B, 1,                dtype=torch.float32)
-    cads    = torch.zeros(B, 1,                dtype=torch.float32)
+    wps_t   = torch.zeros(B, max_W, 3,               dtype=torch.float32)
+    wp_lens = torch.zeros(B,                          dtype=torch.long)
+    speeds  = torch.zeros(B, 1,                       dtype=torch.float32)
+    hists   = torch.zeros(B, HISTORY_K, HISTORY_DIM, dtype=torch.float32)
+    pcs     = torch.zeros(B, 1,                       dtype=torch.float32)
+    cads    = torch.zeros(B, 1,                       dtype=torch.float32)
 
     for k, (_, data, hist_np) in enumerate(raw_batch):
         wp = data["waypoints"].astype(np.float32)
         wps_t[k, :wp.shape[0]].copy_(torch.from_numpy(wp))
         wp_lens[k] = wp.shape[0]
         speeds[k, 0] = float(data["duration_per_segment"])
-        hists[k, :, 0].copy_(torch.from_numpy(hist_np))
+        hists[k].copy_(torch.from_numpy(hist_np))      # (K, 3)
         pcs[k, 0]  = float(data["piece_count"]) if "piece_count" in data else 0.0
         cads[k, 0] = float(data["cadence"])     if "cadence"     in data else 0.0
 
@@ -210,9 +200,14 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
 
     results = []
     for k, (pidx, data, _) in enumerate(raw_batch):
-        T         = len(data["q_real"])
-        q_real    = data["q_real"].astype(np.float32)
-        q_pred    = pred_np[k, :T, :2]
+        T      = len(data["q_real"])
+        q_real = data["q_real"].astype(np.float32)
+        q_des  = data["q_des"].astype(np.float32)[:T]
+        # Si le modèle prédit q_error (= q_real - q_des), on reconstruit q_real
+        if target_keys == ["q_error"]:
+            q_pred = pred_np[k, :T, :2] + q_des
+        else:
+            q_pred = pred_np[k, :T, :2]
         dev_pred  = qual_np[k, :T, 0] * dev_std + dev_mean
         def_prob  = 1.0 / (1.0 + np.exp(-qual_np[k, :T, 1]))
         cut       = data["is_cutting"].astype(bool)
@@ -255,8 +250,8 @@ def _infer_session_batched(model, norm, dev_mean, dev_std,
     norm_mean_t = torch.tensor(norm.mean, dtype=torch.float32)
     norm_std_t  = torch.tensor(norm.std,  dtype=torch.float32)
 
-    # Charger les déviations de session une seule fois
-    session_devs = _load_session_devs(data_dir, sid)
+    # Charger l'historique complet de la session (K, 3)
+    session_hist = _load_session_history(data_dir, sid)
 
     # I/O : charger tous les .npz
     raw_items = []
@@ -266,7 +261,7 @@ def _infer_session_batched(model, norm, dev_mean, dev_std,
             continue
         data     = np.load(path)
         pc       = int(data["piece_count"]) if "piece_count" in data else 0
-        hist_np  = _build_history(session_devs, pc)
+        hist_np  = _build_history(session_hist, pc)          # (K, 3)
         raw_items.append((pidx, data, hist_np))
 
     N = len(raw_items)
@@ -292,7 +287,7 @@ def _run_inference(model, norm, dev_mean, dev_std, target_keys,
         return None
     data     = np.load(path)
     pc       = int(data["piece_count"]) if "piece_count" in data else 0
-    hist_np  = _build_history(_load_session_devs(data_dir, sid), pc)
+    hist_np  = _build_history(_load_session_history(data_dir, sid), pc)  # (K, 3)
     norm_mean_t = torch.tensor(norm.mean, dtype=torch.float32)
     norm_std_t  = torch.tensor(norm.std,  dtype=torch.float32)
     results = _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,

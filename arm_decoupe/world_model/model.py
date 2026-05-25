@@ -3,22 +3,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-HISTORY_K       = 100   # nombre de pièces précédentes dans l'historique
+HISTORY_K        = 100    # nombre de pièces précédentes dans l'historique
+HISTORY_DIM      = 3      # [mean_cut_deviation, tau_cut_rms, q_error_cut_rms]
 PIECE_COUNT_NORM = 1000.0
 CADENCE_NORM     = 60.0
-DEVIATION_NORM   = 0.02  # seuil de défaut — normalise l'historique de déviations
+DEVIATION_NORM   = 0.02   # m  — seuil de défaut
+TAU_RMS_NORM     = 50.0   # Nm — effort moteur typique en découpe
+Q_ERROR_RMS_NORM = 0.01   # rad — erreur de suivi typique
 
 
 # ── History Encoder ────────────────────────────────────────────────────────────
 class HistoryEncoder(nn.Module):
-    """GRU sur K déviations passées (normalisées) → embedding 64D."""
+    """GRU sur K pas d'historique (normalisés) → embedding 64D.
+    Chaque pas : [mean_cut_deviation, tau_cut_rms, q_error_cut_rms]."""
 
-    def __init__(self, K: int = HISTORY_K, hidden: int = 64):
+    def __init__(self, K: int = HISTORY_K, hidden: int = 64,
+                 input_dim: int = HISTORY_DIM):
         super().__init__()
-        self.gru = nn.GRU(1, hidden, batch_first=True)
+        self.gru = nn.GRU(input_dim, hidden, batch_first=True)
 
     def forward(self, history: torch.Tensor) -> torch.Tensor:
-        # history : (B, K, 1) — déviations normalisées
+        # history : (B, K, HISTORY_DIM) — signaux normalisés
         _, h = self.gru(history)
         return h.squeeze(0)   # (B, 64)
 
@@ -247,8 +252,11 @@ class WorldModel(nn.Module):
         """Fusionne les trois sources d'information → embedding 256D."""
         shape_embed = self.encoder(waypoints, wp_lengths) + self.speed_proj(speed)
 
-        # Normalisation des inputs temporels
-        hist_norm = deviation_history / DEVIATION_NORM          # (B, K, 1)
+        # Normalisation des inputs : chaque canal de l'historique a sa propre échelle
+        hist_norm = deviation_history.clone()                   # (B, K, 3)
+        hist_norm[:, :, 0] = hist_norm[:, :, 0] / DEVIATION_NORM
+        hist_norm[:, :, 1] = hist_norm[:, :, 1] / TAU_RMS_NORM
+        hist_norm[:, :, 2] = hist_norm[:, :, 2] / Q_ERROR_RMS_NORM
         pc_norm   = piece_count / PIECE_COUNT_NORM              # (B, 1)
         cad_norm  = cadence     / CADENCE_NORM                  # (B, 1)
 
@@ -262,16 +270,19 @@ class WorldModel(nn.Module):
                 deviation_history=None, piece_count=None, cadence=None,
                 targets=None, max_len=1300, p_teacher=1.0, q_init=None):
         """
-        deviation_history : (B, K, 1) — déviations des K pièces précédentes (en mètres).
+        deviation_history : (B, K, 3) — historique des K pièces précédentes :
+                            [:,:,0] = mean_cut_deviation (m)
+                            [:,:,1] = tau_cut_rms (Nm)
+                            [:,:,2] = q_error_cut_rms (rad)
                             Si None, remplacé par des zéros (machine à neuf / mode single).
         piece_count       : (B, 1) — nombre de pièces produites avant cette pièce.
         cadence           : (B, 1) — pièces/heure.
         speed             : (B, 1) — duration_per_segment en secondes.
         """
         B = waypoints.shape[0]
-        dev = _default_zeros(deviation_history, (B, HISTORY_K, 1), waypoints.device)
-        pc  = _default_zeros(piece_count,       (B, 1),            waypoints.device)
-        cad = _default_zeros(cadence,           (B, 1),            waypoints.device)
+        dev = _default_zeros(deviation_history, (B, HISTORY_K, HISTORY_DIM), waypoints.device)
+        pc  = _default_zeros(piece_count,       (B, 1),                      waypoints.device)
+        cad = _default_zeros(cadence,           (B, 1),                      waypoints.device)
 
         embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad)
         T     = targets.shape[1] if targets is not None else max_len
@@ -283,9 +294,9 @@ class WorldModel(nn.Module):
                 max_len=1300, q_init=None):
         self.eval()
         B = waypoints.shape[0]
-        dev = _default_zeros(deviation_history, (B, HISTORY_K, 1), waypoints.device)
-        pc  = _default_zeros(piece_count,       (B, 1),            waypoints.device)
-        cad = _default_zeros(cadence,           (B, 1),            waypoints.device)
+        dev = _default_zeros(deviation_history, (B, HISTORY_K, HISTORY_DIM), waypoints.device)
+        pc  = _default_zeros(piece_count,       (B, 1),                      waypoints.device)
+        cad = _default_zeros(cadence,           (B, 1),                      waypoints.device)
         embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad)
         return self.decoder(embed, max_len)
 

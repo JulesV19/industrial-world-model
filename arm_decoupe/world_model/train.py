@@ -25,7 +25,8 @@ from tqdm import tqdm
 
 from .dataset import (TrajectoryDataset, collate_fn, target_dim,
                       split_by_session, _load_episode, _is_session_file,
-                      _session_id, HISTORY_K)
+                      _session_id, _load_session_history, _build_history,
+                      HISTORY_K, HISTORY_DIM)
 from .model import WorldModel
 
 
@@ -48,7 +49,7 @@ DEFAULTS = dict(
     num_workers          = 0,        # 0 = optimal : dataset entièrement pré-chargé en RAM
     subsample_factor     = 1,        # sous-échantillonnage temporel (ex: 10 = 1 step sur 10)
     use_amp              = True,     # mixed precision BF16 (A100/T4 uniquement)
-    target_keys          = "q_real",  # signaux à prédire : "q_real" | "q_error" (= q_real-q_des) | séparés par virgule
+    target_keys          = "q_error",  # q_error = q_real-q_des : prédit l'écart à la consigne, pas la trajectoire absolue
     lambda_dev           = 1.0,      # poids de la loss cut_deviation (MSE, espace normalisé)
     lambda_defect        = 0.5,      # poids de la loss cut_defect (BCE)
     lambda_vel           = 0.5,      # poids de la loss sur les différences temporelles (d(q)/dt)
@@ -140,26 +141,35 @@ def eval_rollout(model, val_paths, piece_db, target_keys,
     model.eval()
     with torch.no_grad():
         for sid in eval_sids:
-            # Trier les pièces par numéro croissant
             paths = sorted(
                 sessions[sid],
                 key=lambda p: int(re.search(r"piece(\d+)", p).group(1))
             )
-            pred_devs: list[float] = []   # déviations prédites (en mètres)
+            # Charger l'historique réel de la session (tau_rms, q_error_rms toujours observés)
+            data_dir     = os.path.dirname(paths[0])
+            session_hist = _load_session_history(data_dir, sid)  # (N, 3) ou None
+
+            pred_devs: list[float] = []
             true_devs: list[float] = []
 
-            for i, path in enumerate(paths):
+            for path in paths:
                 ep = _load_episode(path, piece_db, target_keys)
 
-                # Historique depuis les prédictions passées (pas les vraies valeurs)
-                hist_raw = pred_devs[max(0, i - HISTORY_K):i]
-                pad      = [0.0] * (HISTORY_K - len(hist_raw))
-                hist     = np.array(pad + hist_raw, dtype=np.float32)
+                # Déviation (col 0) : simulée depuis les prédictions passées
+                # tau_rms et q_error_rms (col 1-2) : toujours observés depuis la machine
+                hist = _build_history(session_hist, ep["piece_count"])  # (K, 3)
+                # Remplacer col 0 par les déviations prédites accumulées
+                n      = ep["piece_count"]
+                start  = max(0, n - HISTORY_K)
+                pred_slice = pred_devs[start:n]
+                pad_len    = HISTORY_K - len(pred_slice)
+                hist[:pad_len, 0]  = 0.0
+                hist[pad_len:, 0]  = np.array(pred_slice, dtype=np.float32)
 
                 wps    = torch.from_numpy(ep["waypoints"]).unsqueeze(0).to(device)
                 wp_len = torch.tensor([ep["waypoints"].shape[0]]).to(device)
                 speed  = torch.tensor([[ep["speed"]]]).to(device)
-                dev_h  = torch.from_numpy(hist).view(1, HISTORY_K, 1).to(device)
+                dev_h  = torch.from_numpy(hist).unsqueeze(0).to(device)  # (1, K, 3)
                 pc     = torch.tensor([[float(ep["piece_count"])]]).to(device)
                 cad    = torch.tensor([[float(ep["cadence"])]]).to(device)
 
@@ -169,10 +179,9 @@ def eval_rollout(model, val_paths, piece_db, target_keys,
                                    cadence=cad,
                                    max_len=ep["length"])
 
-                # Déviation prédite : moyenne quality[:, :, 0] sur les pas en découpe
-                is_cut = torch.from_numpy(ep["is_cutting"]).to(device).bool()
-                T_ep   = min(quality.shape[1], len(is_cut))
-                q_cut  = quality[0, :T_ep, 0][is_cut[:T_ep]]
+                is_cut   = torch.from_numpy(ep["is_cutting"]).to(device).bool()
+                T_ep     = min(quality.shape[1], len(is_cut))
+                q_cut    = quality[0, :T_ep, 0][is_cut[:T_ep]]
                 pred_dev = float(q_cut.mean()) * dev_std + dev_mean if q_cut.numel() > 0 else 0.0
                 pred_dev = max(0.0, pred_dev)
 

@@ -6,7 +6,8 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-HISTORY_K = 100
+HISTORY_K   = 100
+HISTORY_DIM = 3    # [mean_cut_deviation, tau_cut_rms, q_error_cut_rms]
 
 # Tous les signaux disponibles et leur nombre de colonnes
 METRIC_KEYS = [
@@ -100,6 +101,36 @@ class Normalizer:
 
 
 # ---------------------------------------------------------------------------
+def _load_session_history(data_dir: str, sid: str) -> np.ndarray | None:
+    """
+    Charge l'historique (N, 3) d'une session : [deviation, tau_cut_rms, q_error_cut_rms].
+    Retourne None si introuvable (anciens datasets sans le fichier).
+    """
+    path = os.path.join(data_dir, f"session_{sid}_history.npy")
+    if os.path.exists(path):
+        return np.load(path).astype(np.float32)
+    # Rétrocompatibilité : anciens datasets avec seulement deviations.npy
+    dev_path = os.path.join(data_dir, f"session_{sid}_deviations.npy")
+    if os.path.exists(dev_path):
+        devs = np.load(dev_path).astype(np.float32)
+        return np.stack([devs, np.zeros_like(devs), np.zeros_like(devs)], axis=1)
+    return None
+
+
+def _build_history(session_history: np.ndarray | None, piece_count: int) -> np.ndarray:
+    """
+    Construit le vecteur d'historique (K, 3) depuis le tableau (N, 3) de la session.
+    Si session_history est None, retourne des zéros.
+    """
+    if session_history is None:
+        return np.zeros((HISTORY_K, HISTORY_DIM), dtype=np.float32)
+    n     = int(piece_count)
+    start = max(0, n - HISTORY_K)
+    hist  = session_history[start:n]                                   # (<= K, 3)
+    pad   = np.zeros((HISTORY_K - len(hist), HISTORY_DIM), dtype=np.float32)
+    return np.concatenate([pad, hist], axis=0)                         # (K, 3)
+
+
 def _load_episode(ep_path: str, piece_db: list | None,
                   target_keys: list[str] | None) -> dict:
     """
@@ -210,18 +241,16 @@ class TrajectoryDataset(Dataset):
         session_paths = [p for p in episode_paths if _is_session_file(p)]
         legacy_paths  = [p for p in episode_paths if not _is_session_file(p)]
 
-        # Charger les tableaux de déviations par session
-        session_devs: dict[str, np.ndarray] = {}
-        session_cads: dict[str, float] = {}
+        # Charger les historiques par session (N, 3) : [deviation, tau_rms, q_error_rms]
+        session_hists: dict[str, np.ndarray | None] = {}
+        session_cads:  dict[str, float] = {}
         for sp in session_paths:
             sid = _session_id(sp)
-            if sid not in session_devs:
+            if sid not in session_hists:
                 data_dir = os.path.dirname(sp)
-                dev_path = os.path.join(data_dir, f"session_{sid}_deviations.npy")
                 cad_path = os.path.join(data_dir, f"session_{sid}_cadence.npy")
-                session_devs[sid] = np.load(dev_path) if os.path.exists(dev_path) \
-                                    else np.zeros(1000, dtype=np.float32)
-                session_cads[sid] = float(np.load(cad_path)) if os.path.exists(cad_path) else 0.0
+                session_hists[sid] = _load_session_history(data_dir, sid)
+                session_cads[sid]  = float(np.load(cad_path)) if os.path.exists(cad_path) else 0.0
 
         raw_trajs = []
         items     = []
@@ -231,15 +260,11 @@ class TrajectoryDataset(Dataset):
             raw_trajs.append(ep["obs"])
 
             if _is_session_file(ep_path):
-                sid    = _session_id(ep_path)
-                n      = ep["piece_count"]
-                devs   = session_devs[sid]
-                start  = max(0, n - HISTORY_K)
-                hist   = devs[start:n]                       # jusqu'à K valeurs
-                pad    = np.zeros(HISTORY_K - len(hist), dtype=np.float32)
-                history = np.concatenate([pad, hist])        # (K,) paddé à gauche
+                sid     = _session_id(ep_path)
+                n       = ep["piece_count"]
+                history = _build_history(session_hists[sid], n)  # (K, 3)
             else:
-                history = np.zeros(HISTORY_K, dtype=np.float32)
+                history = np.zeros((HISTORY_K, HISTORY_DIM), dtype=np.float32)
 
             items.append((ep, history))
 
@@ -267,7 +292,7 @@ class TrajectoryDataset(Dataset):
                 "cut_deviation":       dev_norm.astype(np.float32),
                 "cut_defect":          ep["cut_defect"],
                 "is_cutting":          ep["is_cutting"],
-                "deviation_history":   history.astype(np.float32),  # (K,)
+                "deviation_history":   history.astype(np.float32),  # (K, 3)
                 "piece_count":         np.float32(ep["piece_count"]),
                 "cadence":             np.float32(ep["cadence"]),
             })
@@ -285,7 +310,7 @@ class TrajectoryDataset(Dataset):
             torch.from_numpy(s["cut_deviation"]),
             torch.from_numpy(s["cut_defect"]),
             torch.from_numpy(s["is_cutting"]),
-            torch.from_numpy(s["deviation_history"]),   # (K,)
+            torch.from_numpy(s["deviation_history"]),   # (K, 3)
             torch.tensor(s["piece_count"]),
             torch.tensor(s["cadence"]),
         )
@@ -306,7 +331,7 @@ def collate_fn(batch):
         pad_sequence(dev_list,    batch_first=True, padding_value=0.0),
         pad_sequence(defect_list, batch_first=True, padding_value=0.0),
         pad_sequence(cut_list,    batch_first=True, padding_value=0.0),
-        torch.stack(hist_list).unsqueeze(-1),                      # (B, K, 1)
+        torch.stack(hist_list),                                     # (B, K, 3)
         torch.stack(pc_list).unsqueeze(-1),                        # (B, 1)
         torch.stack(cad_list).unsqueeze(-1),                       # (B, 1)
     )

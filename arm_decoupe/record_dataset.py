@@ -91,19 +91,33 @@ def record_episode(waypoints: list, duration: float, machine_state=None):
     cutting_devs = cut_deviation[cutting_mask]
     mean_cut_deviation = float(cutting_devs.mean()) if cutting_devs.size > 0 else 0.0
 
+    # Agrégats mesurables en temps réel depuis les capteurs existants
+    tau_arr     = np.array(log_tau,    dtype=np.float32)
+    q_real_arr  = np.array(log_q_real, dtype=np.float32)
+    q_des_arr   = np.array(log_q_des,  dtype=np.float32)
+    q_error_arr = q_real_arr - q_des_arr
+    if cutting_mask.any():
+        tau_cut_rms     = float(np.sqrt(np.mean(tau_arr[cutting_mask] ** 2)))
+        q_error_cut_rms = float(np.sqrt(np.mean(q_error_arr[cutting_mask] ** 2)))
+    else:
+        tau_cut_rms     = 0.0
+        q_error_cut_rms = 0.0
+
     result = dict(
-        q_real        = np.array(log_q_real,    dtype=np.float32),
+        q_real        = q_real_arr,
         dq_real       = np.array(log_dq_real,   dtype=np.float32),
         q_sensed      = np.array(log_q_sensed,  dtype=np.float32),
         dq_sensed     = np.array(log_dq_sensed, dtype=np.float32),
-        tau           = np.array(log_tau,        dtype=np.float32),
-        q_des         = np.array(log_q_des,      dtype=np.float32),
+        tau           = tau_arr,
+        q_des         = q_des_arr,
         dq_des        = np.array(log_dq_des,     dtype=np.float32),
         is_cutting    = np.array(log_is_cutting, dtype=np.float32),
         cut_deviation = cut_deviation,
         cut_defect    = cut_defect,
         duration_per_segment = np.float32(duration),
         mean_cut_deviation   = np.float32(mean_cut_deviation),
+        tau_cut_rms          = np.float32(tau_cut_rms),
+        q_error_cut_rms      = np.float32(q_error_cut_rms),
         piece_count   = np.int32(machine_state['piece_count'] if machine_state else 0),
         cadence       = np.float32(machine_state['cadence']   if machine_state else 0.0),
         waypoints     = np.array(waypoints,      dtype=np.float32),
@@ -222,20 +236,28 @@ def _run_session_mode(data, rng, out_dir, n_sessions, n_pieces):
                 pbar.set_postfix(défauts=f"{defect_pct:.1f}%", dev=f"{mean_dev*1000:.2f}mm")
                 pbar.update(1)
 
-    # Écriture dans l'ordre original + reconstruction des deviations par session
+    # Écriture dans l'ordre original + reconstruction des historiques par session
     with tqdm(total=total, unit="ep", desc="Écriture  ") as pbar:
         for sess in range(n_sessions):
             cadence, _ = session_meta[sess]
-            session_deviations = []
+            # Historique (N, 3) : [mean_cut_deviation, tau_cut_rms, q_error_cut_rms]
+            session_history = []
             for n in range(n_pieces):
                 arrays, mean_dev, cadence, duration = results[(sess, n)]
-                session_deviations.append(mean_dev)
+                session_history.append([
+                    mean_dev,
+                    float(arrays["tau_cut_rms"]),
+                    float(arrays["q_error_cut_rms"]),
+                ])
                 filename = os.path.join(out_dir, f"session_{sess:03d}_piece{n:04d}.npz")
                 np.savez_compressed(filename, **arrays)
                 pbar.update(1)
 
+            hist_arr = np.array(session_history, dtype=np.float32)   # (N, 3)
+            np.save(os.path.join(out_dir, f"session_{sess:03d}_history.npy"), hist_arr)
+            # Garder deviations.npy (colonne 0) pour la vue session du comparateur
             np.save(os.path.join(out_dir, f"session_{sess:03d}_deviations.npy"),
-                    np.array(session_deviations, dtype=np.float32))
+                    hist_arr[:, 0])
             np.save(os.path.join(out_dir, f"session_{sess:03d}_cadence.npy"),
                     np.float32(cadence))
 
