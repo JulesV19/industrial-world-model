@@ -1,9 +1,9 @@
 # config.py
 
-# --- PARAMÈTRES PHYSIQUES IDÉAUX ---
+# --- PARAMETRES PHYSIQUES IDEAUX ---
 m1, m2 = 2.0, 1.5
 import math as _math
-l1, l2 = _math.sqrt(2), _math.sqrt(2)   # portée totale = 2√2, atteint le coin (2,2)
+l1, l2 = _math.sqrt(2), _math.sqrt(2)
 r1, r2 = 0.5, 0.5
 I1, I2 = 0.1, 0.08
 g = 9.81
@@ -15,40 +15,56 @@ origin = (350, 600)
 HISTORY_LEN = 300
 
 # --- IMPERFECTIONS PHYSIQUES ET BRUIT ---
-# Frottements
+# Frottements (valeurs a froid, T = T_AMBIENT)
 visc_friction_coeffs = [2.5*2, 1.5*2]
-coulomb_friction_coeffs = [5.0, 3.0]
-stribeck_friction_coeffs = [8.0, 5.0]
+coulomb_friction_coeffs = [5.0/2, 3.0/2]
+stribeck_friction_coeffs = [8.0/2, 5.0/2]
 
 # Moteurs et Actuateurs
 ripple_amplitude = 0.05
-gain_error_std = 0.01      # Ecart-type de l'erreur de gain des moteurs
-motor_noise_std = 1.0      # Ecart-type du bruit blanc additif
-deadband_torque = 0.8      # Zone morte (couple minimum pour bouger)
+gain_error_std = 0.001     # Reduit x10 : l'effet temperature est dominant
+motor_noise_std = 0.1      # Reduit x10 : bruit thermique modelise via T
+deadband_torque = 0.8      # Zone morte de base (a T_AMBIENT)
 
 # Capteurs
 encoder_resolution = 8192
-sensor_noise_q_std = 0.002
-sensor_noise_dq_std = 0.008
-sensor_glitch_prob = 0.001  # Probabilité d'avoir un pic de bruit aberrant
-sensor_glitch_q_std = 0.05
-sensor_glitch_dq_std = 0.5
-vel_noise_scale_k = 0.4    # Amplification du bruit capteur par rad/s de vitesse articulaire
+sensor_noise_q_std = 0.0002    # Reduit x10 : la degradation thermique est dominante
+sensor_noise_dq_std = 0.0008   # Reduit x10
+sensor_glitch_prob = 0.0       # Supprime : remplace par degradation continue liee a T
+sensor_glitch_q_std = 0.0
+sensor_glitch_dq_std = 0.0
+vel_noise_scale_k = 0.4
 
-# --- CONTRÔLEUR ---
+# --- CONTROLEUR ---
 Kp_gain = 1200.0
 Kd_gain = 120.0
 alpha_filter = 0.15
 
-# --- DÉGRADATION TEMPORELLE ---
-# ALPHA    : amplification totale max des frottements (1 + ALPHA à saturation)
-#            → augmenter pour des défauts plus sévères en fin de vie
-# HALFLIFE : nombre de pièces pour atteindre 50 % de la dégradation max
-#            → augmenter pour repousser l'apparition des défauts
-#            → diminuer pour les faire apparaître plus tôt
-# GAMMA    : amplification max du bruit moteur à CADENCE_REF
-#            → augmenter si la cadence doit aggraver les défauts
-FRICTION_DEGRAD_ALPHA    = 4.0    # +300 % de frottements à saturation
-FRICTION_DEGRAD_HALFLIFE = 1500   # 50 % de dégradation atteint à ~1500 pièces
-TEMP_NOISE_GAMMA         = 0.2    # bruit moteur peu sensible à la cadence
-CADENCE_REF              = 60.0   # pièces/heure de référence
+# --- DEGRADATION TEMPORELLE (usure mecanique via piece_count) ---
+FRICTION_DEGRAD_ALPHA    = 1
+FRICTION_DEGRAD_HALFLIFE = 1500
+TEMP_NOISE_GAMMA         = 0.2
+CADENCE_REF              = 60.0
+
+# --- MODELE THERMIQUE ---
+# La temperature est une variable d'etat deterministe qui couple cadence et usure
+# aux imprecisions physiques du bras.
+#
+# T_eq(cadence) = T_AMBIENT + T_EQ_SLOPE * cadence
+#   -> temperature d'equilibre atteinte a cadence constante
+#   -> ex : cadence=60 pieces/h -> T_eq ~ 20 + 1.2*60 = 92 degC
+#
+# La montee suit : dT/dt = (T_eq - T) / THERMAL_TAU
+#   -> THERMAL_TAU = 300 s : la machine atteint 63% de T_eq en 5 min
+#
+T_AMBIENT         = 20.0   # degC -- temperature ambiante / depart a froid
+T_EQ_SLOPE        = 1.2    # degC par piece/heure de cadence
+THERMAL_TAU       = 300.0  # s   -- constante de temps thermique (montee)
+THERMAL_COOLDOWN  = 600.0  # s   -- constante de refroidissement entre sessions
+
+# Effets de la temperature sur les parametres physiques
+# (tous proportionnels a l'ecart DeltaT = T - T_AMBIENT)
+TEMP_VISC_COEFF     = 0.04   # Delta visc par degC -- graisse chaude lubrifie moins bien
+TEMP_NOISE_COEFF    = 0.008  # Delta motor_noise_std par degC -- bruit thermique enroulements
+TEMP_DEADBAND_COEFF = 0.005  # Delta deadband par degC -- dilatation mecanique
+TEMP_SENSOR_COEFF   = 0.00002  # Delta sensor_noise_q_std par degC -- dilatation disque encodeur

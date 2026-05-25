@@ -8,6 +8,7 @@ from tqdm import tqdm
 from arm import PhysicsArmEnv, RobotController, TrajectoryPlanner, inverse_kinematics
 from piece import load_shape_database
 from config import l1, l2
+from degradation import ThermalModel
 
 CUT_DEFECT_THRESHOLD = 0.02
 
@@ -23,9 +24,11 @@ def fk(q):
     return np.array([x, y])
 
 
-def record_episode(waypoints: list, duration: float, machine_state=None):
+def record_episode(waypoints: list, duration: float, machine_state=None,
+                   temperature: float = 20.0):
     planner = TrajectoryPlanner(waypoints, duration_per_segment=duration)
-    env = PhysicsArmEnv(initial_q=planner.last_q, machine_state=machine_state)
+    env = PhysicsArmEnv(initial_q=planner.last_q, machine_state=machine_state,
+                        temperature=temperature)
     controller = RobotController()
 
     factory_state = "ARRIVING"
@@ -120,6 +123,7 @@ def record_episode(waypoints: list, duration: float, machine_state=None):
         q_error_cut_rms      = np.float32(q_error_cut_rms),
         piece_count   = np.int32(machine_state['piece_count'] if machine_state else 0),
         cadence       = np.float32(machine_state['cadence']   if machine_state else 0.0),
+        temperature   = np.float32(temperature),
         waypoints     = np.array(waypoints,      dtype=np.float32),
     )
     return result, mean_cut_deviation
@@ -182,10 +186,11 @@ def _run_single_mode(data, rng, out_dir):
 
 
 def _worker_session(args):
-    sess, n, waypoints, duration, cadence = args
+    sess, n, waypoints, duration, cadence, temperature = args
     machine_state = {'piece_count': n, 'cadence': cadence}
-    arrays, mean_dev = record_episode(waypoints, duration, machine_state)
-    return sess, n, arrays, mean_dev, cadence, duration
+    arrays, mean_dev = record_episode(waypoints, duration, machine_state,
+                                      temperature=temperature)
+    return sess, n, arrays, mean_dev, cadence, duration, temperature
 
 
 def _run_session_mode(data, rng, out_dir, n_sessions, n_pieces):
@@ -206,16 +211,25 @@ def _run_session_mode(data, rng, out_dir, n_sessions, n_pieces):
     print(f"  Vitesse ∈ U[{speed_min}, {speed_max}] s/seg  |  Seuil défaut : {CUT_DEFECT_THRESHOLD} m")
 
     # Pré-génération séquentielle des paramètres aléatoires (ordre identique à l'original)
+    # Le modèle thermique est instancié ici (séquentiellement) pour être déterministe :
+    # la température de chaque pièce est calculée analytiquement avant de lancer les workers.
     jobs = []
     session_meta = {}  # sess -> (cadence, duration)
     for sess in range(n_sessions):
         cadence  = float(rng.uniform(CADENCE_MIN, CADENCE_MAX))
         duration = float(rng.uniform(speed_min, speed_max))
         session_meta[sess] = (cadence, duration)
+
+        # Calcul déterministe de la température de chaque pièce dans la session
+        thermal = ThermalModel(cadence=cadence)
         for n in range(n_pieces):
             piece_idx = int(rng.integers(0, len(pieces)))
             waypoints = pieces[piece_idx]
-            jobs.append((sess, n, waypoints, duration, cadence))
+            # Température au début de cette pièce (avant que la pièce chauffe davantage)
+            piece_temp = thermal.temperature
+            # Avancer le modèle thermique de la durée d'une pièce
+            thermal.advance_piece(duration_s=duration)
+            jobs.append((sess, n, waypoints, duration, cadence, piece_temp))
 
     total = len(jobs)
     results = {}
@@ -226,8 +240,8 @@ def _run_session_mode(data, rng, out_dir, n_sessions, n_pieces):
         futures = {pool.submit(_worker_session, job): job for job in jobs}
         with tqdm(total=total, unit="ep", desc="Simulation") as pbar:
             for future in as_completed(futures):
-                sess, n, arrays, mean_dev, cadence, duration = future.result()
-                results[(sess, n)] = (arrays, mean_dev, cadence, duration)
+                sess, n, arrays, mean_dev, cadence, duration, temperature = future.result()
+                results[(sess, n)] = (arrays, mean_dev, cadence, duration, temperature)
                 n_cutting = int(arrays["is_cutting"].sum())
                 n_defects = int(arrays["cut_defect"].sum())
                 total_cutting += n_cutting
@@ -243,7 +257,7 @@ def _run_session_mode(data, rng, out_dir, n_sessions, n_pieces):
             # Historique (N, 3) : [mean_cut_deviation, tau_cut_rms, q_error_cut_rms]
             session_history = []
             for n in range(n_pieces):
-                arrays, mean_dev, cadence, duration = results[(sess, n)]
+                arrays, mean_dev, cadence, duration, temperature = results[(sess, n)]
                 session_history.append([
                     mean_dev,
                     float(arrays["tau_cut_rms"]),

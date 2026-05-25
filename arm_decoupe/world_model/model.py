@@ -7,6 +7,7 @@ HISTORY_K        = 100    # nombre de pièces précédentes dans l'historique
 HISTORY_DIM      = 3      # [mean_cut_deviation, tau_cut_rms, q_error_cut_rms]
 PIECE_COUNT_NORM = 1000.0
 CADENCE_NORM     = 60.0
+TEMP_NORM        = 80.0   # °C — écart max attendu au-dessus de T_AMBIENT (~100°C à cadence max)
 DEVIATION_NORM   = 0.02   # m  — seuil de défaut
 TAU_RMS_NORM     = 50.0   # Nm — effort moteur typique en découpe
 Q_ERROR_RMS_NORM = 0.01   # rad — erreur de suivi typique
@@ -30,17 +31,18 @@ class HistoryEncoder(nn.Module):
 
 # ── Context Encoder ────────────────────────────────────────────────────────────
 class ContextEncoder(nn.Module):
-    """(piece_count_norm, cadence_norm) → 64D."""
+    """(piece_count_norm, cadence_norm, temperature_norm) → 64D."""
 
     def __init__(self, out_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(2, 64), nn.GELU(), nn.Linear(64, out_dim)
+            nn.Linear(3, 64), nn.GELU(), nn.Linear(64, out_dim)
         )
 
-    def forward(self, piece_count: torch.Tensor, cadence: torch.Tensor) -> torch.Tensor:
-        # piece_count, cadence : (B, 1) chacun, déjà normalisés
-        return self.net(torch.cat([piece_count, cadence], dim=-1))  # (B, 64)
+    def forward(self, piece_count: torch.Tensor, cadence: torch.Tensor,
+                temperature: torch.Tensor) -> torch.Tensor:
+        # piece_count, cadence, temperature : (B, 1) chacun, déjà normalisés
+        return self.net(torch.cat([piece_count, cadence, temperature], dim=-1))  # (B, 64)
 
 
 # ── Shape Encoder ──────────────────────────────────────────────────────────────
@@ -117,22 +119,6 @@ class ResBlock(nn.Module):
 
 
 # ── Quality head ──────────────────────────────────────────────────────────────
-class QualityHead(nn.Module):
-    """Prédit (cut_deviation normalisé, logit cut_defect) depuis les hidden states du GRU."""
-
-    def __init__(self, h_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(h_dim, h_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(h_dim // 2, 2),   # [:, 0] = déviation  |  [:, 1] = logit défaut
-        )
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.net(h)   # (..., 2)
-
-
 # ── Temporal decoder ───────────────────────────────────────────────────────────
 class TemporalDecoder(nn.Module):
     """
@@ -181,21 +167,18 @@ class TemporalDecoder(nn.Module):
             ResBlock(h_dim, dropout),
         )
         self.dec_out     = nn.Linear(h_dim, obs_dim)
-        self.quality_head = QualityHead(h_dim, dropout)
 
     def forward(
         self,
         shape_embed: torch.Tensor,
         T:           int,
         targets:     torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         shape_embed : (B, E)
         T           : longueur de séquence à générer
         targets     : ignoré (conservé pour compatibilité avec l'appelant)
-        returns     : (traj: B×T×obs_dim, quality: B×T×2)
-                      quality[:,:,0] = cut_deviation normalisé (régression)
-                      quality[:,:,1] = logit cut_defect (classification)
+        returns     : traj: B×T×obs_dim
         """
         B, E = shape_embed.shape
 
@@ -208,8 +191,7 @@ class TemporalDecoder(nn.Module):
         x       = torch.cat([ctx, pe], dim=-1).contiguous()
         h_raw, _ = self.gru(x, h0)
         traj    = self.dec_out(self.dec_res(self.dec_in(h_raw)))
-        quality = self.quality_head(h_raw)
-        return traj, quality
+        return traj
 
 
 # ── WorldModel ─────────────────────────────────────────────────────────────────
@@ -248,8 +230,9 @@ class WorldModel(nn.Module):
             pe_dim=pe_dim, gru_layers=gru_layers, dropout=dropout,
         )
 
-    def _encode(self, waypoints, wp_lengths, speed, deviation_history, piece_count, cadence):
-        """Fusionne les trois sources d'information → embedding 256D."""
+    def _encode(self, waypoints, wp_lengths, speed, deviation_history,
+                piece_count, cadence, temperature):
+        """Fusionne les quatre sources d'information → embedding 256D."""
         shape_embed = self.encoder(waypoints, wp_lengths) + self.speed_proj(speed)
 
         # Normalisation des inputs : chaque canal de l'historique a sa propre échelle
@@ -259,16 +242,18 @@ class WorldModel(nn.Module):
         hist_norm[:, :, 2] = hist_norm[:, :, 2] / Q_ERROR_RMS_NORM
         pc_norm   = piece_count / PIECE_COUNT_NORM              # (B, 1)
         cad_norm  = cadence     / CADENCE_NORM                  # (B, 1)
+        temp_norm = temperature / TEMP_NORM                     # (B, 1)
 
-        hist_embed = self.history_encoder(hist_norm)            # (B, 64)
-        ctx_embed  = self.context_encoder(pc_norm, cad_norm)    # (B, 64)
+        hist_embed = self.history_encoder(hist_norm)                       # (B, 64)
+        ctx_embed  = self.context_encoder(pc_norm, cad_norm, temp_norm)   # (B, 64)
 
         combined = torch.cat([shape_embed, hist_embed, ctx_embed], dim=-1)
         return self.context_proj(combined)                      # (B, 256)
 
     def forward(self, waypoints, wp_lengths, speed,
                 deviation_history=None, piece_count=None, cadence=None,
-                targets=None, max_len=1300, p_teacher=1.0, q_init=None):
+                temperature=None, targets=None, max_len=1300,
+                p_teacher=1.0, q_init=None):
         """
         deviation_history : (B, K, 3) — historique des K pièces précédentes :
                             [:,:,0] = mean_cut_deviation (m)
@@ -277,27 +262,30 @@ class WorldModel(nn.Module):
                             Si None, remplacé par des zéros (machine à neuf / mode single).
         piece_count       : (B, 1) — nombre de pièces produites avant cette pièce.
         cadence           : (B, 1) — pièces/heure.
+        temperature       : (B, 1) — température courante de la machine (°C).
         speed             : (B, 1) — duration_per_segment en secondes.
         """
         B = waypoints.shape[0]
-        dev = _default_zeros(deviation_history, (B, HISTORY_K, HISTORY_DIM), waypoints.device)
-        pc  = _default_zeros(piece_count,       (B, 1),                      waypoints.device)
-        cad = _default_zeros(cadence,           (B, 1),                      waypoints.device)
+        dev  = _default_zeros(deviation_history, (B, HISTORY_K, HISTORY_DIM), waypoints.device)
+        pc   = _default_zeros(piece_count,       (B, 1),                      waypoints.device)
+        cad  = _default_zeros(cadence,           (B, 1),                      waypoints.device)
+        temp = _default_zeros(temperature,       (B, 1),                      waypoints.device)
 
-        embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad)
+        embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad, temp)
         T     = targets.shape[1] if targets is not None else max_len
         return self.decoder(embed, T, targets=targets)
 
     @torch.no_grad()
     def predict(self, waypoints, wp_lengths, speed,
                 deviation_history=None, piece_count=None, cadence=None,
-                max_len=1300, q_init=None):
+                temperature=None, max_len=1300, q_init=None):
         self.eval()
         B = waypoints.shape[0]
-        dev = _default_zeros(deviation_history, (B, HISTORY_K, HISTORY_DIM), waypoints.device)
-        pc  = _default_zeros(piece_count,       (B, 1),                      waypoints.device)
-        cad = _default_zeros(cadence,           (B, 1),                      waypoints.device)
-        embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad)
+        dev  = _default_zeros(deviation_history, (B, HISTORY_K, HISTORY_DIM), waypoints.device)
+        pc   = _default_zeros(piece_count,       (B, 1),                      waypoints.device)
+        cad  = _default_zeros(cadence,           (B, 1),                      waypoints.device)
+        temp = _default_zeros(temperature,       (B, 1),                      waypoints.device)
+        embed = self._encode(waypoints, wp_lengths, speed, dev, pc, cad, temp)
         return self.decoder(embed, max_len)
 
 

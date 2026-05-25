@@ -113,7 +113,16 @@ def _load_model(ckpt_dir, device):
         gru_layers      = H.get("gru_layers",       3),
         pe_dim          = H.get("pe_dim",           64),
     ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    state_dict = ckpt["model_state"]
+    
+    # Patch pour les anciens checkpoints (passage de 2 à 3 entrées dans le ContextEncoder)
+    ce_weight = state_dict.get("context_encoder.net.0.weight")
+    if ce_weight is not None and ce_weight.shape[1] == 2:
+        zeros = torch.zeros((ce_weight.shape[0], 1), dtype=ce_weight.dtype, device=ce_weight.device)
+        state_dict["context_encoder.net.0.weight"] = torch.cat([ce_weight, zeros], dim=1)
+
+    # strict=False permet d'ignorer la QualityHead qui a disparu du modèle
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     norm     = Normalizer.load(os.path.join(ckpt_dir, "normalizer.npz"))
     dev_mean = float(ckpt.get("dev_mean", 0.0))
@@ -154,13 +163,16 @@ def _load_session_devs(data_dir, sid):
 # ── inférence batched ──────────────────────────────────────────────────────────
 
 def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
-                 raw_batch, device):
+                 raw_batch, device, target_keys=None):
     """
     Inférence sur un batch de pièces déjà chargées.
 
-    raw_batch : liste de (pidx, data_npz, hist_np)
-    Retourne  : liste de dicts résultat (même format que _run_inference).
+    raw_batch   : liste de (pidx, data_npz, hist_np)
+    target_keys : ["q_error"] ou ["q_real"] — détermine la reconstruction q_real
+    Retourne    : liste de dicts résultat.
     """
+    if target_keys is None:
+        target_keys = ["q_error"]
     B     = len(raw_batch)
     max_W = max(item[1]["waypoints"].shape[0] for item in raw_batch)
     max_T = max(len(item[1]["q_real"])         for item in raw_batch)
@@ -172,6 +184,7 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
     hists   = torch.zeros(B, HISTORY_K, HISTORY_DIM, dtype=torch.float32)
     pcs     = torch.zeros(B, 1,                       dtype=torch.float32)
     cads    = torch.zeros(B, 1,                       dtype=torch.float32)
+    temps   = torch.zeros(B, 1,                       dtype=torch.float32)
 
     for k, (_, data, hist_np) in enumerate(raw_batch):
         wp = data["waypoints"].astype(np.float32)
@@ -181,6 +194,7 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
         hists[k].copy_(torch.from_numpy(hist_np))      # (K, 3)
         pcs[k, 0]  = float(data["piece_count"]) if "piece_count" in data else 0.0
         cads[k, 0] = float(data["cadence"])     if "cadence"     in data else 0.0
+        temps[k, 0] = float(data.get("temperature", 20.0))
 
     # Transfert device unique
     wps_t   = wps_t  .to(device, non_blocking=True)
@@ -189,28 +203,41 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
     hists   = hists  .to(device, non_blocking=True)
     pcs     = pcs    .to(device, non_blocking=True)
     cads    = cads   .to(device, non_blocking=True)
+    temps   = temps  .to(device, non_blocking=True)
 
     with torch.inference_mode():
-        embed              = model._encode(wps_t, wp_lens, speeds, hists, pcs, cads)
-        traj_norm, qual_t  = model.decoder(embed, max_T)
+        embed              = model._encode(wps_t, wp_lens, speeds, hists, pcs, cads, temps)
+        traj_norm          = model.decoder(embed, max_T)
 
     # Dénormaliser sur CPU en une opération vectorisée
     pred_np = (traj_norm.cpu() * norm_std_t + norm_mean_t).numpy()  # (B, max_T, D)
-    qual_np = qual_t.cpu().numpy()                                    # (B, max_T, 2)
 
     results = []
     for k, (pidx, data, _) in enumerate(raw_batch):
         T      = len(data["q_real"])
         q_real = data["q_real"].astype(np.float32)
         q_des  = data["q_des"].astype(np.float32)[:T]
-        # Si le modèle prédit q_error (= q_real - q_des), on reconstruit q_real
+        cut    = data["is_cutting"].astype(bool)
+
+        # Sortie brute du modèle (espace normalisé → dénormalisé)
+        raw_pred = pred_np[k, :T, :2]   # q_error_pred si target=q_error, q_real_pred sinon
+
         if target_keys == ["q_error"]:
-            q_pred = pred_np[k, :T, :2] + q_des
+            q_error_pred = raw_pred                    # ce que le modèle prédit directement
+            q_pred       = raw_pred + q_des            # reconstruction q_real
         else:
-            q_pred = pred_np[k, :T, :2]
-        dev_pred  = qual_np[k, :T, 0] * dev_std + dev_mean
-        def_prob  = 1.0 / (1.0 + np.exp(-qual_np[k, :T, 1]))
-        cut       = data["is_cutting"].astype(bool)
+            q_pred       = raw_pred
+            q_error_pred = raw_pred - q_des
+
+        q_error_true = q_real - q_des                  # erreur de suivi réelle
+
+        # Déviation dérivée du FK de la trajectoire prédite (indépendant du quality head)
+        _, tip_pred_fk = _fk_full(q_pred)
+        _, tip_des_fk  = _fk_full(q_des)
+        cut_dev_traj   = np.linalg.norm(tip_pred_fk - tip_des_fk, axis=1).astype(np.float32)
+
+        dev_pred = cut_dev_traj
+        def_prob = (cut_dev_traj > CUT_DEFECT_THRESHOLD).astype(np.float32)
 
         elbow_true, tip_true = _fk_full(q_real)
         elbow_pred, tip_pred = _fk_full(q_pred)
@@ -218,12 +245,15 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
         results.append(dict(
             pidx=pidx, T=T, cut=cut,
             q_real=q_real,
-            q_des=data["q_des"].astype(np.float32),
+            q_des=q_des,
             q_pred=q_pred,
+            q_error_true=q_error_true,
+            q_error_pred=q_error_pred,
             dq_real=data["dq_real"].astype(np.float32),
             tau=data["tau"].astype(np.float32),
             cut_dev_true=data["cut_deviation"].astype(np.float32),
             cut_dev_pred=dev_pred,
+            cut_dev_traj=cut_dev_traj,
             cut_defect=data["cut_defect"].astype(np.float32),
             defect_prob=def_prob,
             elbow_true=elbow_true, tip_true=tip_true,
@@ -237,7 +267,7 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
 
 
 def _infer_session_batched(model, norm, dev_mean, dev_std,
-                            data_dir, sid, device, batch_size=64):
+                            data_dir, sid, device, target_keys=None, batch_size=64):
     """
     Charge toutes les pièces de la session (I/O), puis fait l'inférence
     en batches (GPU). Retourne la liste de dicts résultat.
@@ -273,7 +303,8 @@ def _infer_session_batched(model, norm, dev_mean, dev_std,
         print(f"  batch {b_start // batch_size + 1}/{math.ceil(N / batch_size)}"
               f"  ({b_start + len(batch)}/{N})", end="\r")
         all_results.extend(_infer_batch(model, norm_mean_t, norm_std_t,
-                                         dev_mean, dev_std, batch, device))
+                                         dev_mean, dev_std, batch, device,
+                                         target_keys=target_keys))
 
     print(f"\n  Terminé ({N} pièces).")
     return all_results
@@ -291,7 +322,8 @@ def _run_inference(model, norm, dev_mean, dev_std, target_keys,
     norm_mean_t = torch.tensor(norm.mean, dtype=torch.float32)
     norm_std_t  = torch.tensor(norm.std,  dtype=torch.float32)
     results = _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
-                           [(piece_idx, data, hist_np)], device)
+                           [(piece_idx, data, hist_np)], device,
+                           target_keys=target_keys)
     return results[0] if results else None
 
 
@@ -301,27 +333,31 @@ def _compute_session_metrics(model, norm, dev_mean, dev_std, target_keys,
                               data_dir, sid, device):
     """Agrège les métriques par pièce depuis l'inférence batched."""
     results = _infer_session_batched(model, norm, dev_mean, dev_std,
-                                      data_dir, sid, device)
+                                      data_dir, sid, device, target_keys=target_keys)
     if not results:
         return None
 
-    piece_counts, mean_dev_true, mean_dev_pred = [], [], []
-    max_dev_true,  max_dev_pred  = [], []
+    piece_counts = []
+    mean_dev_true, mean_dev_pred, mean_dev_traj = [], [], []
+    max_dev_true,  max_dev_pred,  max_dev_traj  = [], [], []
     defect_pct_true, defect_pct_pred = [], []
 
     for r in results:
         cut = r["cut"]
         if not cut.any():
             continue
-        dv_t = r["cut_dev_true"][cut]
-        dv_p = r["cut_dev_pred"][cut]
-        df_t = r["cut_defect"][cut]
-        df_p = r["defect_prob"][cut]
+        dv_t  = r["cut_dev_true"][cut]
+        dv_p  = r["cut_dev_pred"][cut]
+        dv_tr = r["cut_dev_traj"][cut]
+        df_t  = r["cut_defect"][cut]
+        df_p  = r["defect_prob"][cut]
         piece_counts.append(r["piece_count"])
         mean_dev_true.append(float(dv_t.mean()))
         mean_dev_pred.append(float(dv_p.mean()))
+        mean_dev_traj.append(float(dv_tr.mean()))
         max_dev_true.append(float(dv_t.max()))
         max_dev_pred.append(float(dv_p.max()))
+        max_dev_traj.append(float(dv_tr.max()))
         defect_pct_true.append(100.0 * float((df_t > 0.5).mean()))
         defect_pct_pred.append(100.0 * float((df_p > 0.5).mean()))
 
@@ -330,9 +366,11 @@ def _compute_session_metrics(model, norm, dev_mean, dev_std, target_keys,
 
     return dict(
         piece_counts    = _s(piece_counts),
-        mean_dev_true   = _s(mean_dev_true),   mean_dev_pred   = _s(mean_dev_pred),
-        max_dev_true    = _s(max_dev_true),     max_dev_pred    = _s(max_dev_pred),
-        defect_pct_true = _s(defect_pct_true),  defect_pct_pred = _s(defect_pct_pred),
+        mean_dev_true   = _s(mean_dev_true),  mean_dev_pred  = _s(mean_dev_pred),
+        mean_dev_traj   = _s(mean_dev_traj),
+        max_dev_true    = _s(max_dev_true),   max_dev_pred   = _s(max_dev_pred),
+        max_dev_traj    = _s(max_dev_traj),
+        defect_pct_true = _s(defect_pct_true), defect_pct_pred = _s(defect_pct_pred),
     )
 
 
@@ -432,7 +470,9 @@ def view_session_compare(data_dir=DATASET_DIR, ckpt_dir=CKPT_DIR, init_sid=None)
         ax_mdev.plot(xs, m["mean_dev_true"] * 1000, color=COL_TRUE, lw=1.8,
                      label="vrai")
         ax_mdev.plot(xs, m["mean_dev_pred"] * 1000, color=COL_PRED, lw=1.8,
-                     ls="--", label="prédit", alpha=0.85)
+                     ls="--", label="quality head", alpha=0.85)
+        ax_mdev.plot(xs, m["mean_dev_traj"] * 1000, color="#aaffaa", lw=1.4,
+                     ls=":", label="FK trajectoire", alpha=0.85)
         ax_mdev.fill_between(xs, 0, m["mean_dev_true"] * 1000,
                              alpha=0.10, color=COL_TRUE)
         ax_mdev.fill_between(xs, 0, m["mean_dev_pred"] * 1000,
@@ -449,7 +489,9 @@ def view_session_compare(data_dir=DATASET_DIR, ckpt_dir=CKPT_DIR, init_sid=None)
         ax_xdev.plot(xs, m["max_dev_true"] * 1000, color=COL_TRUE, lw=1.8,
                      label="vrai")
         ax_xdev.plot(xs, m["max_dev_pred"] * 1000, color=COL_PRED, lw=1.8,
-                     ls="--", label="prédit", alpha=0.85)
+                     ls="--", label="quality head", alpha=0.85)
+        ax_xdev.plot(xs, m["max_dev_traj"] * 1000, color="#aaffaa", lw=1.4,
+                     ls=":", label="FK trajectoire", alpha=0.85)
         ax_xdev.fill_between(xs, 0, m["max_dev_true"] * 1000,
                              alpha=0.10, color=COL_TRUE)
         ax_xdev.fill_between(xs, 0, m["max_dev_pred"] * 1000,
@@ -713,35 +755,43 @@ def view_compare(data_dir=DATASET_DIR, ckpt_dir=CKPT_DIR,
 
         vl_q1  = _plot_sig(ax_q1,  q1_true,  q1_pred,  "Angle 1 (°)",    "°")
         vl_q2  = _plot_sig(ax_q2,  q2_true,  q2_pred,  "Angle 2 (°)",    "°")
-        vl_dq1 = _plot_sig(ax_dq1, result["dq_real"][:, 0], result["q_pred"][:, 0] * 0,
-                            "Vit. ang. 1 (rad/s)", "rad/s")
-        # dq non prédit → tracer seulement le vrai
-        ax_dq1.clear()
-        _style(ax_dq1)
-        ax_dq1.plot(t, result["dq_real"][:, 0], color=COL_TRUE, lw=1.2, label="vrai")
-        ax_dq1.set_title("Vit. ang. 1 (rad/s)", fontweight="bold")
-        ax_dq1.set_ylabel("rad/s", fontsize=8)
+
+        # Erreur articulaire (q_real - q_des) : ce que le modèle prédit directement
+        qe1_true = result["q_error_true"][:, 0] * 1000   # mrad
+        qe1_pred = result["q_error_pred"][:, 0] * 1000
+        qe2_true = result["q_error_true"][:, 1] * 1000
+        qe2_pred = result["q_error_pred"][:, 1] * 1000
+
+        ax_dq1.clear(); _style(ax_dq1)
+        ax_dq1.plot(t, qe1_true, color=COL_TRUE, lw=1.2, label="vrai")
+        ax_dq1.plot(t, qe1_pred, color=COL_PRED, lw=1.2, ls="--", label="prédit", alpha=0.85)
+        ax_dq1.axhline(0, color="#555577", lw=0.8, ls=":")
+        ax_dq1.set_title("Erreur q1 = q_real−q_des (mrad)", fontweight="bold")
+        ax_dq1.set_ylabel("mrad", fontsize=8)
         ax_dq1.legend(fontsize=7, loc="upper right",
                       facecolor=BG_PANEL, edgecolor=COL_BORDER, labelcolor=COL_TEXT)
         ax_dq1.grid(True, linestyle=":", alpha=0.3, color=COL_GRID)
         vl_dq1 = ax_dq1.axvline(0, color="white", lw=1.0, alpha=0.6)
 
-        ax_dq2.clear()
-        _style(ax_dq2)
-        ax_dq2.plot(t, result["dq_real"][:, 1], color=COL_TRUE, lw=1.2, label="vrai")
-        ax_dq2.set_title("Vit. ang. 2 (rad/s)", fontweight="bold")
-        ax_dq2.set_ylabel("rad/s", fontsize=8)
+        ax_dq2.clear(); _style(ax_dq2)
+        ax_dq2.plot(t, qe2_true, color=COL_TRUE, lw=1.2, label="vrai")
+        ax_dq2.plot(t, qe2_pred, color=COL_PRED, lw=1.2, ls="--", label="prédit", alpha=0.85)
+        ax_dq2.axhline(0, color="#555577", lw=0.8, ls=":")
+        ax_dq2.set_title("Erreur q2 = q_real−q_des (mrad)", fontweight="bold")
+        ax_dq2.set_ylabel("mrad", fontsize=8)
         ax_dq2.set_xlabel("Temps (s)", fontsize=8)
         ax_dq2.legend(fontsize=7, loc="upper right",
                       facecolor=BG_PANEL, edgecolor=COL_BORDER, labelcolor=COL_TEXT)
         ax_dq2.grid(True, linestyle=":", alpha=0.3, color=COL_GRID)
         vl_dq2 = ax_dq2.axvline(0, color="white", lw=1.0, alpha=0.6)
 
-        # cut_deviation
-        ax_dev.plot(t, result["cut_dev_true"] * 1000, color=COL_TRUE,  lw=1.2,
+        # Déviation coupe : vrai + quality head + dérivée du FK de la trajectoire prédite
+        ax_dev.plot(t, result["cut_dev_true"] * 1000, color=COL_TRUE, lw=1.2,
                     label="vrai (mm)")
-        ax_dev.plot(t, result["cut_dev_pred"] * 1000, color=COL_PRED,   lw=1.2,
-                    ls="--", label="prédit (mm)", alpha=0.85)
+        ax_dev.plot(t, result["cut_dev_pred"] * 1000, color=COL_PRED, lw=1.2,
+                    ls="--", label="quality head", alpha=0.85)
+        ax_dev.plot(t, result["cut_dev_traj"] * 1000, color="#aaffaa", lw=1.2,
+                    ls=":", label="FK trajectoire", alpha=0.85)
         ax_dev.fill_between(t, 0, result["cut_dev_true"] * 1000,
                             where=cut, color=COL_TRUE, alpha=0.05)
         ax_dev.axhline(CUT_DEFECT_THRESHOLD * 1000, color="#ffaa44",

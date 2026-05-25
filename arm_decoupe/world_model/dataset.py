@@ -166,6 +166,7 @@ def _load_episode(ep_path: str, piece_db: list | None,
         mean_cut_deviation  = np.float32(mean_dev),
         piece_count         = pc,
         cadence             = np.float32(cad),
+        temperature         = np.float32(data["temperature"]) if "temperature" in data else np.float32(20.0),
     )
 
 
@@ -295,6 +296,7 @@ class TrajectoryDataset(Dataset):
                 "deviation_history":   history.astype(np.float32),  # (K, 3)
                 "piece_count":         np.float32(ep["piece_count"]),
                 "cadence":             np.float32(ep["cadence"]),
+                "temperature":         np.float32(ep["temperature"]),
             })
 
     def __len__(self):
@@ -313,6 +315,7 @@ class TrajectoryDataset(Dataset):
             torch.from_numpy(s["deviation_history"]),   # (K, 3)
             torch.tensor(s["piece_count"]),
             torch.tensor(s["cadence"]),
+            torch.tensor(s["temperature"]),
         )
 
 
@@ -320,7 +323,7 @@ class TrajectoryDataset(Dataset):
 def collate_fn(batch):
     (waypoints_list, speeds, obs_list, lengths,
      dev_list, defect_list, cut_list,
-     hist_list, pc_list, cad_list) = zip(*batch)
+     hist_list, pc_list, cad_list, temp_list) = zip(*batch)
 
     return (
         pad_sequence(waypoints_list, batch_first=True, padding_value=0.0),
@@ -334,4 +337,5 @@ def collate_fn(batch):
         torch.stack(hist_list),                                     # (B, K, 3)
         torch.stack(pc_list).unsqueeze(-1),                        # (B, 1)
         torch.stack(cad_list).unsqueeze(-1),                       # (B, 1)
+        torch.stack(temp_list).unsqueeze(-1),                      # (B, 1)
     )

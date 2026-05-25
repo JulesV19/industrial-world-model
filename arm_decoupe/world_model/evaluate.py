@@ -186,7 +186,7 @@ def evaluate(args: argparse.Namespace):
             wps, wp_len = wps.to(device), wp_len.to(device)
             speed       = speed.to(device)
             T = obs.shape[1]
-            preds, _ = model(wps, wp_len, speed, max_len=T)
+            preds = model(wps, wp_len, speed, max_len=T)
 
             pred_np = preds[0].cpu().numpy()    # (T, 15)
             tgt_np  = obs  [0].numpy()          # (T, 15)

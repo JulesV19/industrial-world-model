@@ -75,35 +75,6 @@ def compute_loss(
     return ((preds - targets).pow(2) * mask[..., None]).sum() / n
 
 
-def compute_quality_loss(
-    quality_preds: torch.Tensor,    # (B, T, 2)
-    cut_dev: torch.Tensor,          # (B, T) — normalisé
-    cut_defect: torch.Tensor,       # (B, T) — 0/1
-    is_cutting: torch.Tensor,       # (B, T) — masque
-    seq_lengths: torch.Tensor,
-    lambda_dev: float,
-    lambda_defect: float,
-) -> torch.Tensor:
-    B, T = cut_dev.shape
-    device = quality_preds.device
-    seq_mask = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
-    cut_mask = is_cutting * seq_mask   # (B, T) — actif uniquement pendant la découpe
-    n_cut    = cut_mask.sum() + 1e-8
-
-    loss = torch.tensor(0.0, device=device)
-    if lambda_dev > 0:
-        loss = loss + lambda_dev * (
-            (quality_preds[:, :, 0] - cut_dev).pow(2) * cut_mask
-        ).sum() / n_cut
-    if lambda_defect > 0:
-        loss = loss + lambda_defect * (
-            F.binary_cross_entropy_with_logits(
-                quality_preds[:, :, 1], cut_defect, reduction="none"
-            ) * cut_mask
-        ).sum() / n_cut
-    return loss
-
-
 # ── device ─────────────────────────────────────────────────────────────────────
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -111,87 +82,6 @@ def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-# ── rollout autorégressif ──────────────────────────────────────────────────────
-
-def eval_rollout(model, val_paths, piece_db, target_keys,
-                 normalizer, dev_mean, dev_std, device, n_sessions=5):
-    """
-    Évalue le modèle en déroulement autorégressif sur n_sessions sessions de val.
-
-    À chaque pièce, l'historique est construit depuis les déviations que le modèle
-    a lui-même prédites (pas les vraies valeurs) — ce qui simule l'usage réel où
-    on prédit une session complète sans observer le comportement réel entre les pièces.
-
-    Retourne le MSE moyen (en m²) entre la courbe de déviation prédite et la courbe réelle.
-    """
-    # Grouper les chemins de val par session
-    sessions: dict[str, list[str]] = {}
-    for p in val_paths:
-        if _is_session_file(p):
-            sessions.setdefault(_session_id(p), []).append(p)
-
-    if not sessions:
-        return None
-
-    eval_sids = sorted(sessions.keys())[:n_sessions]
-    all_session_mse = []
-
-    model.eval()
-    with torch.no_grad():
-        for sid in eval_sids:
-            paths = sorted(
-                sessions[sid],
-                key=lambda p: int(re.search(r"piece(\d+)", p).group(1))
-            )
-            # Charger l'historique réel de la session (tau_rms, q_error_rms toujours observés)
-            data_dir     = os.path.dirname(paths[0])
-            session_hist = _load_session_history(data_dir, sid)  # (N, 3) ou None
-
-            pred_devs: list[float] = []
-            true_devs: list[float] = []
-
-            for path in paths:
-                ep = _load_episode(path, piece_db, target_keys)
-
-                # Déviation (col 0) : simulée depuis les prédictions passées
-                # tau_rms et q_error_rms (col 1-2) : toujours observés depuis la machine
-                hist = _build_history(session_hist, ep["piece_count"])  # (K, 3)
-                # Remplacer col 0 par les déviations prédites accumulées
-                n      = ep["piece_count"]
-                start  = max(0, n - HISTORY_K)
-                pred_slice = pred_devs[start:n]
-                pad_len    = HISTORY_K - len(pred_slice)
-                hist[:pad_len, 0]  = 0.0
-                hist[pad_len:, 0]  = np.array(pred_slice, dtype=np.float32)
-
-                wps    = torch.from_numpy(ep["waypoints"]).unsqueeze(0).to(device)
-                wp_len = torch.tensor([ep["waypoints"].shape[0]]).to(device)
-                speed  = torch.tensor([[ep["speed"]]]).to(device)
-                dev_h  = torch.from_numpy(hist).unsqueeze(0).to(device)  # (1, K, 3)
-                pc     = torch.tensor([[float(ep["piece_count"])]]).to(device)
-                cad    = torch.tensor([[float(ep["cadence"])]]).to(device)
-
-                _, quality = model(wps, wp_len, speed,
-                                   deviation_history=dev_h,
-                                   piece_count=pc,
-                                   cadence=cad,
-                                   max_len=ep["length"])
-
-                is_cut   = torch.from_numpy(ep["is_cutting"]).to(device).bool()
-                T_ep     = min(quality.shape[1], len(is_cut))
-                q_cut    = quality[0, :T_ep, 0][is_cut[:T_ep]]
-                pred_dev = float(q_cut.mean()) * dev_std + dev_mean if q_cut.numel() > 0 else 0.0
-                pred_dev = max(0.0, pred_dev)
-
-                pred_devs.append(pred_dev)
-                true_devs.append(ep["mean_cut_deviation"])
-
-            mse = float(np.mean((np.array(pred_devs) - np.array(true_devs)) ** 2))
-            all_session_mse.append(mse)
-
-    return float(np.mean(all_session_mse)) if all_session_mse else None
 
 
 # ── training loop ──────────────────────────────────────────────────────────────
@@ -292,7 +182,7 @@ def train(cfg: dict | None = None):
 
         for (wps, wp_len, speed, obs, seq_len,
              cut_dev, cut_defect, is_cutting,
-             dev_hist, piece_count, cadence) in train_loader:
+             dev_hist, piece_count, cadence, temperature) in train_loader:
             wps, wp_len  = wps.to(device), wp_len.to(device)
             speed        = speed.to(device)
             obs, seq_len = obs.to(device), seq_len.to(device)
@@ -302,6 +192,7 @@ def train(cfg: dict | None = None):
             dev_hist     = dev_hist.to(device)
             piece_count  = piece_count.to(device)
             cadence      = cadence.to(device)
+            temperature  = temperature.to(device)
 
             if sf > 1:
                 obs        = obs[:, ::sf, :].contiguous()
@@ -312,16 +203,13 @@ def train(cfg: dict | None = None):
 
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                preds, quality = model(wps, wp_len, speed,
-                                       deviation_history=dev_hist,
-                                       piece_count=piece_count,
-                                       cadence=cadence,
-                                       targets=obs)
+                preds = model(wps, wp_len, speed,
+                              deviation_history=dev_hist,
+                              piece_count=piece_count,
+                              cadence=cadence,
+                              temperature=temperature,
+                              targets=obs)
                 loss = compute_loss(preds, obs, seq_len)
-                loss = loss + compute_quality_loss(
-                    quality, cut_dev, cut_defect, is_cutting, seq_len,
-                    H["lambda_dev"], H["lambda_defect"],
-                )
                 if H["lambda_vel"] > 0:
                     vel_pred = preds[:, 1:] - preds[:, :-1]
                     vel_true = obs[:, 1:]   - obs[:, :-1]
@@ -346,7 +234,7 @@ def train(cfg: dict | None = None):
         with torch.no_grad():
             for (wps, wp_len, speed, obs, seq_len,
                  cut_dev, cut_defect, is_cutting,
-                 dev_hist, piece_count, cadence) in val_loader:
+                 dev_hist, piece_count, cadence, temperature) in val_loader:
                 wps, wp_len  = wps.to(device), wp_len.to(device)
                 speed        = speed.to(device)
                 obs, seq_len = obs.to(device), seq_len.to(device)
@@ -356,6 +244,7 @@ def train(cfg: dict | None = None):
                 dev_hist     = dev_hist.to(device)
                 piece_count  = piece_count.to(device)
                 cadence      = cadence.to(device)
+                temperature  = temperature.to(device)
                 if sf > 1:
                     obs        = obs[:, ::sf, :].contiguous()
                     cut_dev    = cut_dev[:, ::sf].contiguous()
@@ -363,16 +252,13 @@ def train(cfg: dict | None = None):
                     is_cutting = is_cutting[:, ::sf].contiguous()
                     seq_len    = (seq_len + sf - 1) // sf
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    preds, quality = model(wps, wp_len, speed,
-                                           deviation_history=dev_hist,
-                                           piece_count=piece_count,
-                                           cadence=cadence,
-                                           targets=obs)
+                    preds = model(wps, wp_len, speed,
+                                  deviation_history=dev_hist,
+                                  piece_count=piece_count,
+                                  cadence=cadence,
+                                  temperature=temperature,
+                                  targets=obs)
                     val_loss = compute_loss(preds, obs, seq_len)
-                    val_loss = val_loss + compute_quality_loss(
-                        quality, cut_dev, cut_defect, is_cutting, seq_len,
-                        H["lambda_dev"], H["lambda_defect"],
-                    )
                     if H["lambda_vel"] > 0:
                         vel_pred = preds[:, 1:] - preds[:, :-1]
                         vel_true = obs[:, 1:]   - obs[:, :-1]
@@ -393,17 +279,7 @@ def train(cfg: dict | None = None):
         history["lr"       ].append(current_lr)
         history["grad_norm"].append(avg_grad_norm)
 
-        # Rollout autorégressif (évaluation sur sessions complètes de val)
-        rollout_mse = None
-        every = H.get("rollout_eval_every", 10)
-        if every > 0 and epoch % every == 0:
-            rollout_mse = eval_rollout(
-                model, val_paths, piece_db, target_keys,
-                train_ds.normalizer, train_ds.dev_mean, train_ds.dev_std,
-                device, H.get("n_rollout_sessions", 5),
-            )
-            if rollout_mse is not None:
-                history["rollout"].append((epoch, rollout_mse))
+
 
         improved = avg_val < best_val
         if improved:
