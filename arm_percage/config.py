@@ -39,3 +39,9 @@ vel_noise_scale_k = 0.4    # Amplification du bruit capteur par rad/s de vitesse
 Kp_gain = 1200.0
 Kd_gain = 120.0
 alpha_filter = 0.15
+
+# --- DÉGRADATION TEMPORELLE ---
+FRICTION_DEGRAD_ALPHA    = 3.0
+FRICTION_DEGRAD_HALFLIFE = 1500
+TEMP_NOISE_GAMMA         = 0.2
+CADENCE_REF              = 60.0

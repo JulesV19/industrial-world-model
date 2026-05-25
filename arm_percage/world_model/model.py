@@ -2,6 +2,44 @@ import math
 import torch
 import torch.nn as nn
 
+HISTORY_K        = 100
+PIECE_COUNT_NORM = 1000.0
+CADENCE_NORM     = 60.0
+DEVIATION_NORM   = 0.02
+
+
+# ── History Encoder ────────────────────────────────────────────────────────────
+class HistoryEncoder(nn.Module):
+    """GRU sur K erreurs de perçage passées (normalisées) → embedding 64D."""
+
+    def __init__(self, K: int = HISTORY_K, hidden: int = 64):
+        super().__init__()
+        self.gru = nn.GRU(1, hidden, batch_first=True)
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        _, h = self.gru(history)
+        return h.squeeze(0)   # (B, 64)
+
+
+# ── Context Encoder ────────────────────────────────────────────────────────────
+class ContextEncoder(nn.Module):
+    """(piece_count_norm, cadence_norm) → 64D."""
+
+    def __init__(self, out_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 64), nn.GELU(), nn.Linear(64, out_dim)
+        )
+
+    def forward(self, piece_count: torch.Tensor, cadence: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([piece_count, cadence], dim=-1))  # (B, 64)
+
+
+def _default_zeros(tensor, shape, device):
+    if tensor is not None:
+        return tensor
+    return torch.zeros(shape, dtype=torch.float32, device=device)
+
 
 class SinusoidalPE(nn.Module):
     def __init__(self, dim: int, max_len: int = 4000):
@@ -59,6 +97,8 @@ class DrillWorldModel(nn.Module):
         gru_layers:       int   = 2,
         n_attn_heads:     int   = 4,
         dropout:          float = 0.1,
+        history_hidden:   int   = 64,
+        context_dim:      int   = 64,
     ):
         super().__init__()
         self.h_dim      = h_dim
@@ -74,8 +114,12 @@ class DrillWorldModel(nn.Module):
             nn.GELU(),
             nn.Linear(corner_embed_dim, corner_embed_dim),
         )
+        self.history_encoder = HistoryEncoder(K=HISTORY_K, hidden=history_hidden)
+        self.context_encoder = ContextEncoder(out_dim=context_dim)
+        # Trunk élargi : 4×coins + speed + hist + ctx
+        trunk_in = 4 * corner_embed_dim + corner_embed_dim + history_hidden + context_dim
         self.global_trunk = nn.Sequential(
-            nn.Linear(4 * corner_embed_dim + corner_embed_dim, embed_dim),
+            nn.Linear(trunk_in, embed_dim),
             nn.GELU(),
             ResBlock(embed_dim, dropout),
             ResBlock(embed_dim, dropout),
@@ -118,18 +162,29 @@ class DrillWorldModel(nn.Module):
 
     def forward(
         self,
-        corners: torch.Tensor,               # (B, 4, 2)
-        speed:   torch.Tensor,               # (B, 1)
-        T:       int | None        = None,
-        lengths: torch.Tensor | None = None,  # (B,) nombre de pas valides
+        corners:           torch.Tensor,               # (B, 4, 2)
+        speed:             torch.Tensor,               # (B, 1)
+        T:                 int | None        = None,
+        lengths:           torch.Tensor | None = None, # (B,) nombre de pas valides
+        deviation_history: torch.Tensor | None = None, # (B, K, 1) erreurs passées
+        piece_count:       torch.Tensor | None = None, # (B, 1)
+        cadence:           torch.Tensor | None = None, # (B, 1)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B = corners.shape[0]
 
-        coin_emb = self.corner_enc(corners)   # (B, 4, corner_embed_dim)
-        spd_emb  = self.speed_enc(speed)      # (B, corner_embed_dim)
+        dev = _default_zeros(deviation_history, (B, HISTORY_K, 1), corners.device)
+        pc  = _default_zeros(piece_count,       (B, 1),            corners.device)
+        cad = _default_zeros(cadence,           (B, 1),            corners.device)
+
+        coin_emb   = self.corner_enc(corners)                   # (B, 4, corner_embed_dim)
+        spd_emb    = self.speed_enc(speed)                      # (B, corner_embed_dim)
+        hist_emb   = self.history_encoder(dev / DEVIATION_NORM) # (B, 64)
+        ctx_emb    = self.context_encoder(pc / PIECE_COUNT_NORM,
+                                          cad / CADENCE_NORM)  # (B, 64)
         ctx = self.global_trunk(
-            torch.cat([coin_emb.reshape(B, -1), spd_emb], dim=-1)
-        )                                     # (B, embed_dim)
+            torch.cat([coin_emb.reshape(B, -1), spd_emb,
+                       hist_emb, ctx_emb], dim=-1)
+        )                                                       # (B, embed_dim)
 
         if T is None:
             T = 512

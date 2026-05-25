@@ -9,15 +9,24 @@ from config import (
     sensor_glitch_prob, sensor_glitch_q_std, sensor_glitch_dq_std,
     Kp_gain, Kd_gain, alpha_filter, vel_noise_scale_k
 )
+from degradation import friction_multiplier, noise_multiplier
 
 class PhysicsArmEnv:
-    def __init__(self, initial_q=None):
+    def __init__(self, initial_q=None, machine_state=None):
         if initial_q is None:
             self.state = np.array([math.pi/4, -math.pi/2, 0.0, 0.0])
         else:
             self.state = np.array([initial_q[0], initial_q[1], 0.0, 0.0])
         self.dt = 0.01
-        
+
+        fm = friction_multiplier(machine_state['piece_count']) if machine_state else 1.0
+        nm = noise_multiplier(machine_state['cadence'])        if machine_state else 1.0
+        self.visc              = np.array(visc_friction_coeffs)     * fm
+        self.coulomb           = np.array(coulomb_friction_coeffs)  * fm
+        self.stribeck          = np.array(stribeck_friction_coeffs) * fm
+        self.motor_noise_std_eff = motor_noise_std * nm
+        self.deadband_eff        = deadband_torque * nm
+
     def get_matrices(self, q, dq):
         M11 = m1*r1**2 + m2*(l1**2 + r2**2 + 2*l1*r2*np.cos(q[1])) + I1 + I2
         M12 = m2*(r2**2 + l1*r2*np.cos(q[1])) + I2
@@ -33,28 +42,25 @@ class PhysicsArmEnv:
 
     def apply_physics_imperfections(self, tau, dq):
         # 1. Frottements visqueux (proportionnels à la vitesse)
-        f_visc = np.array(visc_friction_coeffs) * dq
-        
-        # 2. Frottements de Coulomb (constants avec le signe de la vitesse)
-        f_coulomb = np.array(coulomb_friction_coeffs) * np.tanh(dq * 10.0) 
-        
-        # 3. Effet Stribeck (pic d'adhérence au démarrage, chute quand on prend de la vitesse)
-        f_stribeck = np.array(stribeck_friction_coeffs) * np.exp(-np.abs(dq) * 15.0) * np.tanh(dq * 100.0)
-        
-        # 4. Torque ripple (défaut électromagnétique des moteurs)
-        ripple = tau * ripple_amplitude * np.sin(50 * self.state[0:2]) 
-        
-        # 5. BRUIT ACTUATEUR (Non-déterministe, Process Noise)
-        # Erreur de gain (le moteur ne donne pas exactement ce qu'on demande)
-        gain_error = np.random.normal(1.0, gain_error_std, 2)
-        # Bruit blanc additif (imperfections de l'électronique de puissance)
-        motor_noise = np.random.normal(0, motor_noise_std, 2)
-        
-        # 6. Zone morte (Deadband - jeu mécanique où les petites commandes n'ont pas d'effet)
-        deadband = deadband_torque
-        tau_effective = np.where(np.abs(tau) > deadband, tau - np.sign(tau)*deadband, 0.0)
+        f_visc = self.visc * dq
 
-        # Calcul du couple final appliqué au système
+        # 2. Frottements de Coulomb (constants avec le signe de la vitesse)
+        f_coulomb = self.coulomb * np.tanh(dq * 10.0)
+
+        # 3. Effet Stribeck (pic d'adhérence au démarrage, chute quand on prend de la vitesse)
+        f_stribeck = self.stribeck * np.exp(-np.abs(dq) * 15.0) * np.tanh(dq * 100.0)
+
+        # 4. Torque ripple (défaut électromagnétique des moteurs)
+        ripple = tau * ripple_amplitude * np.sin(50 * self.state[0:2])
+
+        # 5. BRUIT ACTUATEUR (Non-déterministe, Process Noise)
+        gain_error  = np.random.normal(1.0, gain_error_std, 2)
+        motor_noise = np.random.normal(0, self.motor_noise_std_eff, 2)
+
+        # 6. Zone morte (Deadband - jeu mécanique où les petites commandes n'ont pas d'effet)
+        tau_effective = np.where(np.abs(tau) > self.deadband_eff,
+                                 tau - np.sign(tau) * self.deadband_eff, 0.0)
+
         tau_real = tau_effective * gain_error + motor_noise - f_visc - f_coulomb - f_stribeck + ripple
         return tau_real
 

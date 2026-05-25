@@ -74,7 +74,10 @@ def train(cfg: dict | None = None):
     device = get_device()
     print(f"Device : {device}")
 
-    episode_paths = sorted(glob.glob(os.path.join(H["data_dir"], "episode_*.npz")))
+    episode_paths = sorted(
+        glob.glob(os.path.join(H["data_dir"], "episode_*.npz")) +
+        glob.glob(os.path.join(H["data_dir"], "session_*_piece*.npz"))
+    )
     print(f"Épisodes : {len(episode_paths)}")
     os.makedirs(H["save_dir"], exist_ok=True)
 
@@ -125,17 +128,27 @@ def train(cfg: dict | None = None):
         train_total = 0.0
         total_gnorm = 0.0
 
-        for corners, speed, traj_target, lengths, offsets_target, defects_target in train_loader:
-            corners        = corners.to(device)                  # (B, 4, 2)
-            speed          = speed.unsqueeze(-1).to(device)      # (B, 1)
-            traj_target    = traj_target.to(device)              # (B, T_max, 2)
-            lengths        = lengths.to(device)                  # (B,)
-            offsets_target = offsets_target.to(device)           # (B, 4, 2)
-            defects_target = defects_target.to(device)           # (B, 4)
+        for (corners, speed, traj_target, lengths,
+             offsets_target, defects_target,
+             dev_hist, piece_count, cadence) in train_loader:
+            corners        = corners.to(device)
+            speed          = speed.unsqueeze(-1).to(device)
+            traj_target    = traj_target.to(device)
+            lengths        = lengths.to(device)
+            offsets_target = offsets_target.to(device)
+            defects_target = defects_target.to(device)
+            dev_hist       = dev_hist.to(device)
+            piece_count    = piece_count.to(device)
+            cadence        = cadence.to(device)
 
             T = traj_target.shape[1]
             optimizer.zero_grad()
-            traj_pred, offsets_pred, defect_logits = model(corners, speed, T, lengths)
+            traj_pred, offsets_pred, defect_logits = model(
+                corners, speed, T, lengths,
+                deviation_history=dev_hist,
+                piece_count=piece_count,
+                cadence=cadence,
+            )
 
             loss_traj   = _traj_loss(traj_pred, traj_target, lengths)
             loss_offset = F.mse_loss(offsets_pred, offsets_target)
@@ -160,16 +173,26 @@ def train(cfg: dict | None = None):
         model.eval()
         val_total = 0.0
         with torch.no_grad():
-            for corners, speed, traj_target, lengths, offsets_target, defects_target in val_loader:
+            for (corners, speed, traj_target, lengths,
+                 offsets_target, defects_target,
+                 dev_hist, piece_count, cadence) in val_loader:
                 corners        = corners.to(device)
                 speed          = speed.unsqueeze(-1).to(device)
                 traj_target    = traj_target.to(device)
                 lengths        = lengths.to(device)
                 offsets_target = offsets_target.to(device)
                 defects_target = defects_target.to(device)
+                dev_hist       = dev_hist.to(device)
+                piece_count    = piece_count.to(device)
+                cadence        = cadence.to(device)
 
                 T = traj_target.shape[1]
-                traj_pred, offsets_pred, defect_logits = model(corners, speed, T, lengths)
+                traj_pred, offsets_pred, defect_logits = model(
+                    corners, speed, T, lengths,
+                    deviation_history=dev_hist,
+                    piece_count=piece_count,
+                    cadence=cadence,
+                )
 
                 loss = (H["lambda_traj"]   * _traj_loss(traj_pred, traj_target, lengths)
                         +                    F.mse_loss(offsets_pred, offsets_target)
