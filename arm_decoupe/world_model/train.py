@@ -54,6 +54,7 @@ DEFAULTS = dict(
     lambda_defect        = 0.5,      # poids de la loss cut_defect (BCE)
     lambda_vel           = 0.5,      # poids de la loss sur les différences temporelles (d(q)/dt)
     lambda_acc           = 1.0,      # poids de la loss sur l'accélération (d²(q)/dt²) — sensible aux décalages temporels
+    cut_weight           = 10.0,     # facteur multiplicatif sur les steps is_cutting dans la loss
     rollout_eval_every   = 10,       # évaluer le rollout autorégressif toutes les N epochs (0 = jamais)
     n_rollout_sessions   = 5,        # nombre de sessions de val utilisées pour le rollout
     save_dir             = "world_model/checkpoints",
@@ -67,11 +68,17 @@ def compute_loss(
     preds: torch.Tensor,
     targets: torch.Tensor,
     seq_lengths: torch.Tensor,
+    is_cutting: torch.Tensor | None = None,
+    cut_weight: float = 1.0,
 ) -> torch.Tensor:
-    """MSE masqué sur les séquences de longueurs variables."""
+    """MSE masqué sur les séquences de longueurs variables.
+    cut_weight > 1 : upweight les steps de découpe pour éviter le collapse sur la position initiale.
+    """
     B, T, D = preds.shape
     device  = preds.device
     mask    = (torch.arange(T, device=device)[None, :] < seq_lengths[:, None]).float()
+    if is_cutting is not None and cut_weight > 1.0:
+        mask = mask * (1.0 + (cut_weight - 1.0) * is_cutting[:, :T])
     n       = mask.sum() * D + 1e-8
     return ((preds - targets).pow(2) * mask[..., None]).sum() / n
 
@@ -210,18 +217,21 @@ def train(cfg: dict | None = None):
                               cadence=cadence,
                               temperature=temperature,
                               targets=obs)
-                loss = compute_loss(preds, obs, seq_len)
+                cw = H.get("cut_weight", 1.0)
+                loss = compute_loss(preds, obs, seq_len, is_cutting, cw)
                 if H["lambda_vel"] > 0:
                     vel_pred = preds[:, 1:] - preds[:, :-1]
                     vel_true = obs[:, 1:]   - obs[:, :-1]
                     loss = loss + H["lambda_vel"] * compute_loss(
-                        vel_pred, vel_true, (seq_len - 1).clamp(min=0)
+                        vel_pred, vel_true, (seq_len - 1).clamp(min=0),
+                        is_cutting[:, 1:], cw,
                     )
                 if H.get("lambda_acc", 0) > 0:
                     acc_pred = preds[:, 2:] - 2 * preds[:, 1:-1] + preds[:, :-2]
                     acc_true = obs[:, 2:]   - 2 * obs[:, 1:-1]   + obs[:, :-2]
                     loss = loss + H["lambda_acc"] * compute_loss(
-                        acc_pred, acc_true, (seq_len - 2).clamp(min=0)
+                        acc_pred, acc_true, (seq_len - 2).clamp(min=0),
+                        is_cutting[:, 2:], cw,
                     )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -269,14 +279,17 @@ def train(cfg: dict | None = None):
                     if H["lambda_vel"] > 0:
                         vel_pred = preds[:, 1:] - preds[:, :-1]
                         vel_true = obs[:, 1:]   - obs[:, :-1]
-                        val_loss = val_loss + H["lambda_vel"] * compute_loss(
-                            vel_pred, vel_true, (seq_len - 1).clamp(min=0)
+                        cw = H.get("cut_weight", 1.0)
+                    val_loss = val_loss + H["lambda_vel"] * compute_loss(
+                            vel_pred, vel_true, (seq_len - 1).clamp(min=0),
+                            is_cutting[:, 1:], cw,
                         )
                     if H.get("lambda_acc", 0) > 0:
                         acc_pred = preds[:, 2:] - 2 * preds[:, 1:-1] + preds[:, :-2]
                         acc_true = obs[:, 2:]   - 2 * obs[:, 1:-1]   + obs[:, :-2]
                         val_loss = val_loss + H["lambda_acc"] * compute_loss(
-                            acc_pred, acc_true, (seq_len - 2).clamp(min=0)
+                            acc_pred, acc_true, (seq_len - 2).clamp(min=0),
+                            is_cutting[:, 2:], cw,
                         )
                     val_total += val_loss.item()
 
