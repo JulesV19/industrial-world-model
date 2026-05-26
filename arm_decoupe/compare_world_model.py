@@ -206,8 +206,9 @@ def _infer_batch(model, norm_mean_t, norm_std_t, dev_mean, dev_std,
     temps   = temps  .to(device, non_blocking=True)
 
     with torch.inference_mode():
-        embed              = model._encode(wps_t, wp_lens, speeds, hists, pcs, cads, temps)
-        traj_norm          = model.decoder(embed, max_T)
+        context_embed, wp_embeds, wp_mask = model._encode(
+            wps_t, wp_lens, speeds, hists, pcs, cads, temps)
+        traj_norm = model.decoder(wp_embeds, context_embed, max_T, wp_mask)
 
     # Dénormaliser sur CPU en une opération vectorisée
     pred_np = (traj_norm.cpu() * norm_std_t + norm_mean_t).numpy()  # (B, max_T, D)
