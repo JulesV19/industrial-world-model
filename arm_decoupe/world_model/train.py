@@ -53,7 +53,8 @@ DEFAULTS = dict(
     lambda_dev           = 1.0,      # poids de la loss cut_deviation (MSE, espace normalisé)
     lambda_defect        = 0.5,      # poids de la loss cut_defect (BCE)
     lambda_vel           = 0.5,      # poids de la loss sur les différences temporelles (d(q)/dt)
-    lambda_acc           = 1.0,      # poids de la loss sur l'accélération (d²(q)/dt²) — sensible aux décalages temporels
+    lambda_acc           = 0.0,      # désactivé : récompense le collapse (acc=0 sur 80% des steps)
+    lambda_var           = 0.5,      # variance matching : pénalise si std(pred) ≠ std(target) dans le temps
     cut_weight           = 10.0,     # facteur multiplicatif sur les steps is_cutting dans la loss
     rollout_eval_every   = 10,       # évaluer le rollout autorégressif toutes les N epochs (0 = jamais)
     n_rollout_sessions   = 5,        # nombre de sessions de val utilisées pour le rollout
@@ -233,6 +234,10 @@ def train(cfg: dict | None = None):
                         acc_pred, acc_true, (seq_len - 2).clamp(min=0),
                         is_cutting[:, 2:], cw,
                     )
+                if H.get("lambda_var", 0) > 0:
+                    pred_std = preds.std(dim=1)
+                    true_std = obs.std(dim=1)
+                    loss = loss + H["lambda_var"] * F.mse_loss(pred_std, true_std)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), H["grad_clip"])
@@ -291,6 +296,10 @@ def train(cfg: dict | None = None):
                             acc_pred, acc_true, (seq_len - 2).clamp(min=0),
                             is_cutting[:, 2:], cw,
                         )
+                    if H.get("lambda_var", 0) > 0:
+                        pred_std = preds.std(dim=1)
+                        true_std = obs.std(dim=1)
+                        val_loss = val_loss + H["lambda_var"] * F.mse_loss(pred_std, true_std)
                     val_total += val_loss.item()
 
         avg_train     = train_total     / len(train_loader)
